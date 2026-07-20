@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+.venv-research/
+
+# Secrets — never commit real API keys
+.env
+.streamlit/secrets.toml
+
+# Private/local data
+data/raw/
+data/cache/
+data/private/
+*.db
+*.sqlite
+*.sqlite3
+portfolio_transactions.csv
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+

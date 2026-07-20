@@ -1,0 +1,5 @@
+account,fund_code,share_class,trade_date,action,amount,shares,nav,fee,dividend,source
+示例账户,000001,A,2026-01-05,buy,1000,980.392157,1.02,0,0,sample
+示例账户,000001,A,2026-02-05,buy,500,476.190476,1.05,0,0,sample
+示例账户,000001,A,2026-03-10,dividend_cash,0,0,,0,20,sample
+
