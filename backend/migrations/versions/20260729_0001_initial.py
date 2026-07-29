@@ -4,12 +4,12 @@ Revision ID: 20260729_0001
 Revises:
 """
 
-from typing import Sequence
+from collections.abc import Sequence
 
 from alembic import op
 
-from app.database import Base
 from app import models  # noqa: F401
+from app.database import Base
 
 revision: str = "20260729_0001"
 down_revision: str | None = None
