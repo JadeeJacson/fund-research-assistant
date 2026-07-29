@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from typing import Protocol
 
-
 KNOWN_FUNDS: dict[str, tuple[str, str, str]] = {
     "017470": ("嘉实上证科创板芯片ETF联接C", "index", "C"),
     "013308": ("易方达恒生科技ETF联接(QDII)A", "unsupported", "A"),
