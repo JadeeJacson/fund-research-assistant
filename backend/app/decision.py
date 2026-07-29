@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 from .analytics import Metrics
 
-
 SUPPORTED_TYPES = {"index", "active_equity", "bond"}
 
 
