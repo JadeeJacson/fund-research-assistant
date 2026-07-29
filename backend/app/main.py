@@ -393,7 +393,7 @@ def create_app(
         if not session.get(Candidate, payload.candidate_id):
             raise HTTPException(status_code=404, detail="候选基金不存在")
         digest = hashlib.sha256(
-            f"{payload.source_url}|{payload.published_at}|{payload.content}".encode("utf-8")
+            f"{payload.source_url}|{payload.published_at}|{payload.content}".encode()
         ).hexdigest()
         existing = session.scalar(
             select(Evidence).where(
