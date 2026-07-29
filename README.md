@@ -1,98 +1,162 @@
-# 个人基金研究辅助系统
+# 个人基金研究助手
 
-> 面向中国公募基金与个人实验组合的本地研究工具。  
-> 当前状态：`v0.1 Streamlit 原型`，正在按 [v1 重建计划](docs/ROADMAP.md) 迁移。  
-> 本项目仅用于个人学习、数据整理和投资研究辅助，不构成投资建议。
+面向中国公募基金和个人实验组合的本地研究工具。系统把公开基金数据、支付宝截图中的个人事实、确定性指标、风险规则和可选 DeepSeek 解释组合成可追溯报告。
 
-## 项目目标
+> 本项目用于个人学习、数据整理和投资研究辅助，不构成收益保证、自动投顾或交易指令。
 
-系统优先解决“购买一只基金前如何完成可追溯研究”，并在导入个人持仓和交易后，给出有条件、可解释的操作建议：
+## MVP 已实现
 
-- 排除、继续观察、建仓候选；
-- 小幅加仓、继续持有、暂停加仓；
-- 减仓候选、退出复核；
-- 建议仓位区间；
-- 满足哪些数值与持续时间后可以重新考虑买入或卖出；
-- 建议依据、反方证据、未知项、数据截止日期和失效条件。
+- React + TypeScript + Vite 桌面端；
+- FastAPI + SQLAlchemy + SQLite 后端；
+- Alembic 初始迁移；
+- 六位基金代码候选列表；
+- AKShare 公开净值刷新，失败时明确回退到离线演示数据；
+- 指数基金、主动权益基金和普通债券基金的基础研究；
+- 2～3 个月与约 1 年两套期限；
+- 建仓候选、小幅加仓、继续持有、暂停加仓、减仓候选和退出复核；
+- 约 10% 阶段性回撤参考、目标仓位区间和条件触发器；
+- 主题基金识别与单主题仓位上限；
+- 支付宝候选、持仓和交易截图上传；
+- RapidOCR 本地识别、草稿校对、图片去重和正式确认；
+- 人工持仓快照与交易流水；
+- Evidence Pack 人工录入；
+- DeepSeek 可选结构化解释和 Mock 降级；
+- 全部页面按钮均连接真实 API 或本地动作；
+- pytest、Vitest、Playwright 和 GitHub Actions；
+- Windows 一键安装与启动脚本。
 
-系统不自动登录支付宝，不控制账户，不自动申购、赎回或调仓，不保证历史规律在未来继续有效。
+旧 Streamlit v0.1 仍保留，便于回归比较；新功能不再继续堆到旧页面。
 
-## 已确认的 v1 范围
+## 数据如何分工
 
-- 使用场景：Windows 本地、单用户；后续保留部署为 C 端网页的迁移能力。
-- 前端：React + TypeScript + Vite。
-- 后端：FastAPI + Python。
-- 本地存储：SQLite；通过 SQLAlchemy 与 Alembic 管理，未来可迁移 PostgreSQL。
-- 个人数据：通过支付宝候选、持仓和交易截图导入，先本地 OCR，再人工校对。
-- 公开数据：以官方披露和结构化 Provider 为主，截图不代替基金公开研究。
-- AI：DeepSeek 只分析经过筛选的文字证据和匿名化量化摘要，不直接识别图片，不生成核心金融数字。
-- 支持期限：2～3 个月短期研究与约 1 年持有研究，使用不同判断规则。
-- 风险参考线：实验组合阶段性回撤约 10%；短期仓位约 10%。
-- 现金约束：系统不管理实验资金之外的现金预留。
-- 完整评价：第一阶段覆盖指数基金、主动权益基金和普通债券基金。
-- 识别但暂不完整评价：QDII、黄金/商品、FOF、公募 REITs 等。
-
-## 数据分工
-
-| 数据 | 主要来源 | 用途 |
+| 数据 | 来源 | 用途 |
 | --- | --- | --- |
-| 候选基金代码与个人自选 | 手工输入、支付宝截图 | 建立候选列表 |
-| 个人持仓、成本与交易 | 支付宝截图、人工确认 | 组合与收益分析 |
-| 净值、分红、拆分、基金档案 | 官方披露、AKShare 等 Provider | 确定性指标 |
-| 基准、指数规则与成分 | 指数编制机构、交易所 | 指数基金评价 |
-| 定期报告、公告与政策 | 基金管理人、证监会披露平台、交易所 | 事实证据 |
-| 新闻 | 可靠财经媒体 | 事件补充，不覆盖官方数字 |
-| AI 结论 | DeepSeek 对 Evidence Pack 的结构化解释 | 摘要、风险、反方观点与未知项 |
+| 个人候选、持仓、交易 | 支付宝截图或人工录入 | 描述你真正关注和持有的内容 |
+| 基金档案与净值 | AKShare 和后续官方 Provider | 计算确定性指标 |
+| 公告、政策和新闻 | 用户录入可追溯 Evidence Pack | 补充事件影响和反方证据 |
+| AI 解释 | DeepSeek 读取结构化报告与 Evidence Pack | 解释，不改变数字和操作状态 |
 
-完整规则见 [数据来源规范](docs/DATA_SOURCES.md) 和 [截图与数据导入](docs/DATA_IMPORT.md)。
+支付宝详情页截图不能代替基金公开研究。DeepSeek 不直接接收原始图片。
 
-## 当前实现与目标实现
+## Windows 快速开始
 
-当前 `main` 中已有 Streamlit、AKShare、SQLite、基础指标、交易 CSV、DeepSeek 结构化输出和 pytest 测试，但它只是待验收的原型：
+需要：
 
-- 当前净值口径、基金分类和评分规则不足以支撑真实操作建议；
-- 组合页面尚未形成完整成本、收益、重叠与风险分析；
-- AI 证据目前主要依赖手工录入；
-- 当前页面将逐步迁移为真实前后端网页；
-- v1 不直接在旧启发式评分上继续堆功能。
+- Windows 10/11；
+- Python 3.12；
+- Node.js 22 LTS；
+- Git。
 
-以 [项目状态](docs/PROJECT_STATUS.md) 为当前事实，以 [产品需求](docs/PRODUCT_REQUIREMENTS.md) 为 v1 目标，两者不得混写。
+首次安装：
 
-## 文档入口
+```powershell
+git clone https://github.com/JadeeJacson/fund-research-assistant.git
+cd fund-research-assistant
+.\scripts\mvp-install.ps1
+```
+
+安装脚本会：
+
+1. 创建 `.venv-mvp`；
+2. 安装 FastAPI、AKShare、RapidOCR 等依赖；
+3. 安装前端依赖并生成生产构建；
+4. 在不存在时复制 `.env.example` 为 `.env`。
+
+启动：
+
+```powershell
+.\scripts\mvp-start.ps1
+```
+
+浏览器会打开：
+
+```text
+http://127.0.0.1:8000
+```
+
+开发模式：
+
+```powershell
+.\scripts\mvp-dev.ps1
+```
+
+前端地址为 `http://127.0.0.1:5173`，API 为 `http://127.0.0.1:8000/api/v1`，接口文档为 `http://127.0.0.1:8000/api/docs`。
+
+## 首次使用顺序
+
+1. 在“候选研究”添加六位基金代码；
+2. 点击“刷新公开数据”；
+3. 分别运行“研究 2～3 个月”和“研究约 1 年”；
+4. 如有支付宝截图，在“截图导入”上传并逐字段校对；
+5. 确认导入后查看持仓和交易；
+6. 为候选报告录入公告或可靠新闻证据；
+7. 可选启用 DeepSeek，再生成结构化解释；
+8. 在“条件触发”保存阈值并主动检查。
+
+若页面标记“离线演示数据”，只能用于验证流程，不能作为实际操作依据。
+
+## DeepSeek
+
+编辑本机 `.env`：
+
+```dotenv
+FUNDLAB_AI_ENABLED=true
+DEEPSEEK_API_KEY=你的密钥
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=按当前官方文档填写
+```
+
+模型名不在代码中写死。设置页的“测试 AI 连接”只发送最小匿名请求，不包含截图、持仓或交易。没有密钥时确定性分析仍可运行。
+
+## 测试
+
+后端：
+
+```powershell
+cd backend
+..\.venv-mvp\Scripts\python.exe -m pytest
+```
+
+前端：
+
+```powershell
+cd frontend
+npm test
+npm run build
+npm run e2e
+```
+
+## MVP 已知边界
+
+- AKShare 是便利入口，不是官方法定披露来源；
+- 当前事件证据需要人工提供 URL 和正文，尚未自动抓取官方公告；
+- OCR 可以识别截图中的可见内容，但不能恢复 UI 已截断文本；
+- 交易列表截图通常缺少确认净值、份额和费用，精确收益计算前必须补录；
+- 行业/主题仓位由可审计规则约束，不由 AI 自由分配；
+- 10% 是阶段性风险参考，不是止损保证；
+- 本地触发器需要用户主动检查；
+- 当前是单用户本地应用，不能直接暴露到公网。
+
+后续事项保留在 [实施路线](docs/ROADMAP.md)，MVP 的实际实现对应关系见 [MVP 实现说明](docs/MVP_IMPLEMENTATION.md)。
+
+## 文档
 
 - [文档索引](docs/INDEX.md)
-- [项目当前状态](docs/PROJECT_STATUS.md)
-- [v1 产品需求](docs/PRODUCT_REQUIREMENTS.md)
+- [产品需求](docs/PRODUCT_REQUIREMENTS.md)
+- [项目状态](docs/PROJECT_STATUS.md)
 - [目标架构](docs/ARCHITECTURE.md)
-- [操作建议引擎](docs/DECISION_ENGINE.md)
-- [前端交互契约](docs/FRONTEND_CONTRACT.md)
-- [实施路线](docs/ROADMAP.md)
+- [数据来源](docs/DATA_SOURCES.md)
+- [截图导入](docs/DATA_IMPORT.md)
+- [决策引擎](docs/DECISION_ENGINE.md)
+- [前端交互](docs/FRONTEND_CONTRACT.md)
 - [测试与验收](docs/TESTING_ACCEPTANCE.md)
 - [安全与隐私](docs/SECURITY.md)
 
-## 当前原型运行
+## 重要边界
 
-在 v1 前后端骨架完成前，旧原型仍按以下方式启动：
-
-```powershell
-py -3.12 -m venv .venv
-.venv\Scripts\activate
-python -m pip install --upgrade pip
-pip install -e ".[dev]"
-Copy-Item .env.example .env
-fundlab init-db
-streamlit run app.py
-```
-
-此入口只用于验收和迁移参考，不代表 v1 最终使用方式。
-
-## 开发原则
-
-- `main` 保持可运行，每个里程碑使用独立分支和 PR。
-- 功能代码必须有对应需求、验收标准和测试。
-- 不显示没有实际行为的按钮或页面入口。
-- 不用单一综合分数掩盖风险、证据和未知项。
-- 不允许 LLM 绕过数据门控、风险门控或仓位约束。
-- 普通 CI 不连接付费 API，不读取个人截图和真实交易。
-- 未完成能力写入路线图，不用占位按钮伪装成已实现功能。
-
+- 不登录支付宝；
+- 不保存支付宝 Cookie、密码或账户凭据；
+- 不自动申购、赎回、转换或调仓；
+- 不让大模型生成核心金融数字；
+- 不把单位净值低简单解释为“便宜”；
+- 不在资料不足时伪造强结论。
