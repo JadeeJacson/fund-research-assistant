@@ -8,8 +8,8 @@ from alembic import context
 from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
 
-from app.database import Base
 from app import models  # noqa: F401
+from app.database import Base
 
 config = context.config
 load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
