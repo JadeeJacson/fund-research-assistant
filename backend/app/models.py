@@ -8,7 +8,6 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
-    Integer,
     String,
     Text,
     UniqueConstraint,
@@ -95,7 +94,7 @@ class ImportBatch(Base):
     status: Mapped[str] = mapped_column(String(32), default="needs_review")
     error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-    items: Mapped[list["ImportItem"]] = relationship(
+    items: Mapped[list[ImportItem]] = relationship(
         cascade="all, delete-orphan", order_by="ImportItem.id"
     )
 
