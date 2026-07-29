@@ -1,70 +1,146 @@
-# 开发与维护
+# 开发规范
 
-## 环境
+## 1. 当前与目标
 
-```powershell
-py -3.12 -m venv .venv
-.venv\Scripts\activate
-pip install -e ".[dev]"
+`main` 当前是可运行的 Streamlit v0.1 原型。v1 将逐步迁移为 React + TypeScript 前端与 FastAPI 后端。迁移期间：
+
+- 不把目标目录和命令描述成已完成；
+- 新架构在独立 PR 中加入；
+- 旧入口保留到替代流程通过验收；
+- README 的“已实现”随合并结果更新。
+
+实施顺序见 [路线图](ROADMAP.md)。
+
+## 2. 目标目录
+
+```text
+fund-research-assistant/
+├── frontend/
+│   ├── src/
+│   └── tests/
+├── backend/
+│   ├── app/
+│   │   ├── api/
+│   │   ├── application/
+│   │   ├── domain/
+│   │   ├── providers/
+│   │   ├── analytics/
+│   │   ├── decision/
+│   │   ├── evidence/
+│   │   ├── ai/
+│   │   └── ocr/
+│   └── tests/
+├── migrations/
+├── fixtures/
+├── scripts/
+└── docs/
 ```
 
-## 命令
+这是目标布局，不表示这些目录已经存在。
 
-```powershell
-fundlab init-db
-fundlab ai-check
-fundlab analyze 000001
-fundlab analyze 000001 --ai
-streamlit run app.py
-ruff check .
-pytest
+## 3. 环境策略
+
+- Python 和 Node 版本在 M1 固定；
+- Python 使用项目级虚拟环境和锁定依赖；
+- Node 使用锁文件并在 CI 使用确定性安装；
+- OCR 模型通过明确版本和校验和管理；
+- `.env.example` 只列配置名和安全默认值；
+- 开发、测试和用户数据目录分离。
+
+不在系统 Python 全局安装项目依赖。
+
+## 4. 分支与 PR
+
+- 从最新 `main` 创建短生命周期分支；
+- 一个 PR 只解决一个清楚问题；
+- 开始前检查未提交或未关联改动；
+- 不混入格式化全仓等无关修改；
+- PR 正文说明目标、范围、迁移、测试和风险；
+- 未经请求不直接推送 `main`；
+- 文档、代码和测试在同一功能 PR 同步更新。
+
+建议分支：
+
+- `agent/docs-*`
+- `agent/backend-*`
+- `agent/frontend-*`
+- `agent/ocr-*`
+- `agent/decision-*`
+
+## 5. 代码边界
+
+- `domain` 不依赖框架或供应商；
+- API 路由只校验和调度，不实现金融公式；
+- Provider 只做获取与标准化；
+- 计算函数尽量纯函数；
+- 决策状态不依赖 LLM 文本；
+- OCR 草稿和正式记录类型分离；
+- 前端不复制后端金融规则；
+- 时间、币种、单位和份额类别显式建模。
+
+## 6. 数据库迁移
+
+- 所有 Schema 变更使用 Alembic；
+- 每次迁移说明升级、降级和数据影响；
+- 不修改已经发布的迁移；
+- 迁移在空库和含样例数据的库测试；
+- 破坏性迁移先备份并分阶段实施；
+- SQLite 与未来 PostgreSQL 的差异在测试中显式处理。
+
+## 7. API 变更
+
+- 使用 `/api/v1`；
+- 先更新 OpenAPI 和契约测试；
+- 错误码稳定且可供前端判断；
+- 长任务使用任务资源和状态；
+- 写操作具有幂等策略；
+- 删除或重命名字段需要迁移期；
+- 前端生成或校验 API 类型，避免手工漂移。
+
+## 8. 质量命令
+
+M1 应提供统一脚本，目标命令形态：
+
+```bash
+./scripts/dev
+./scripts/test
+./scripts/lint
+./scripts/e2e
 ```
 
-无 pytest 时，当前测试同样兼容标准库：
+Windows 同时提供等价 PowerShell 入口。以上命令只有在脚本实际加入仓库后才写入 README 快速开始。
 
-```powershell
-python -m unittest discover -s tests -v
-```
+提交前至少执行受影响范围的格式化、lint、类型检查、单元测试、契约测试和端到端测试。完整门槛见 [测试与验收](TESTING_ACCEPTANCE.md)。
 
-## 常见修改位置
+## 9. 固定样例
 
-| 需求 | 文件 |
-| --- | --- |
-| 修改本地参数 | `.env` |
-| 修改默认参数和新增环境变量 | `src/fundlab/config.py`、`.env.example` |
-| AKShare 字段变化 | `src/fundlab/providers/akshare_provider.py` |
-| 新数据源 | `src/fundlab/providers/` |
-| 收益和风险公式 | `src/fundlab/analytics/`，同时修改测试 |
-| 状态阈值 | `src/fundlab/rules/decision.py` |
-| DeepSeek 请求 | `src/fundlab/ai/providers/deepseek.py` |
-| AI 输出 Schema | `src/fundlab/domain/models.py` |
-| AI Prompt | `prompts/`，同时提高 Prompt 版本 |
-| 数据库表 | `src/fundlab/storage/schema.py`，正式升级时增加迁移 |
-| 页面 | `app.py`、`pages/` |
+- 使用小型、匿名、可读的基金/市场响应；
+- OCR 图片必须脱敏；
+- 不提交用户上传原图；
+- 固定发布日期和可用日期；
+- 明确预期计算结果；
+- Provider 响应记录来源和 Schema 版本；
+- 更新 Snapshot 时必须审查业务差异。
 
-## 分支和提交
+## 10. 日志与调试
 
-- `main` 保持可运行；
-- 功能分支使用 `feature/<name>`；
-- Provider 修复使用 `fix/provider-<name>`；
-- 公式、Prompt 和依赖升级使用独立提交；
-- 提交前运行 Ruff、测试和敏感信息检查。
+- 使用结构化日志；
+- 记录请求/任务 ID、状态、耗时和错误码；
+- 不记录密钥、原图、完整 OCR 文本或完整交易流水；
+- 开发模式堆栈只出现在本地服务端；
+- 用户可导出的诊断包默认脱敏；
+- 调试开关不得改变金融计算结果。
 
-## 新增 Provider
+## 11. 完成定义
 
-实现 `FundDataProvider`：
+功能完成必须同时满足：
 
-```python
-class NewProvider:
-    name = "new_provider"
-    def get_fund_profile(self, fund_code): ...
-    def get_nav_history(self, fund_code, start_date=None, end_date=None): ...
-    def health_check(self): ...
-```
-
-将上游原始字段转换为 `FundProfile` 和 `NavRecord`，不要把上游 DataFrame 传入页面。
-
-## 新增 AI 供应商
-
-实现 `LLMProvider.generate_structured`，返回 `LLMResult`。业务层不能导入供应商 SDK，也不能把供应商响应对象泄露到领域层。
-
+- 需求和边界明确；
+- 代码分层正确；
+- 数据迁移完整；
+- 成功、空、失败和重试状态实现；
+- 所有可见按钮有真实行为；
+- 测试通过；
+- 安全和隐私检查通过；
+- 文档只描述已实现能力；
+- PR 中说明已知限制和下一步。
