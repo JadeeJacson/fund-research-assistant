@@ -30,7 +30,7 @@ class Settings:
     keep_uploads: bool = True
 
     @classmethod
-    def from_env(cls, project_root: Path | None = None) -> "Settings":
+    def from_env(cls, project_root: Path | None = None) -> Settings:
         root = (project_root or Path(__file__).resolve().parents[2]).resolve()
         if load_dotenv is not None:
             load_dotenv(root / ".env", override=False)
