@@ -2,14 +2,15 @@
 
 ## 当前事实
 
-- [项目状态](PROJECT_STATUS.md)：当前 `main` 已实现、未验证和存在的问题。
+- [项目状态](PROJECT_STATUS.md)：当前 v0.1 与 React/FastAPI MVP 的已实现和未完成能力。
+- [MVP 实现说明](MVP_IMPLEMENTATION.md)：代码布局、API、数据回退、按钮和验收。
 - [故障排查](TROUBLESHOOTING.md)：当前 Streamlit 原型的运行问题。
 
 ## v1 产品与架构
 
 - [产品需求](PRODUCT_REQUIREMENTS.md)：用户、范围、使用流程、输出和非目标。
 - [目标架构](ARCHITECTURE.md)：React/FastAPI、本地运行、领域边界与未来部署。
-- [实施路线](ROADMAP.md)：文档基线至候选、OCR、组合、AI和部署的顺序。
+- [实施路线](ROADMAP.md)：文档基线至候选、OCR、组合、AI 和部署的顺序。
 
 ## 数据与判断
 
@@ -31,8 +32,8 @@
 
 1. `README.md`
 2. `docs/PROJECT_STATUS.md`
-3. `docs/PRODUCT_REQUIREMENTS.md`
-4. `docs/ARCHITECTURE.md`
-5. `docs/ROADMAP.md`
-6. `AGENTS.md`
-
+3. `docs/MVP_IMPLEMENTATION.md`
+4. `docs/PRODUCT_REQUIREMENTS.md`
+5. `docs/ARCHITECTURE.md`
+6. `docs/ROADMAP.md`
+7. `AGENTS.md`
