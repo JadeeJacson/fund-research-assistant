@@ -1,91 +1,133 @@
-# DeepSeek API 配置
+# DeepSeek 接入规范
 
-## 当前接口选择
+## 1. 定位
 
-项目使用 DeepSeek 官方 OpenAI 兼容的 `/chat/completions` 接口：
+DeepSeek 是可选的文本解释层，不是数据源、OCR 引擎、金融计算器或最终决策器。没有 DeepSeek 密钥时，基金事实、确定性指标、规则门控和操作状态仍应正常工作。
 
-- Base URL：`https://api.deepseek.com`
-- 默认模型：`deepseek-v4-flash`
-- 输出模式：`response_format={"type":"json_object"}`
-- 默认关闭 Thinking，便于稳定地产生结构化事件 JSON
+图片处理顺序：
 
-截至 2026-07，旧别名 `deepseek-chat` 和 `deepseek-reasoner` 即将停止服务，因此项目不再把它们设为默认值。模型可能继续升级，应优先修改 `.env`，不应在页面代码中替换模型名。
-
-官方参考：
-
-- [DeepSeek API Quick Start](https://api-docs.deepseek.com/)
-- [JSON Output](https://api-docs.deepseek.com/guides/json_mode)
-- [Models & Pricing](https://api-docs.deepseek.com/quick_start/pricing/)
-
-## 获取并配置 Key
-
-1. 登录 [DeepSeek Platform](https://platform.deepseek.com/)；
-2. 创建 API Key；
-3. 在项目根目录执行：
-
-```powershell
-Copy-Item .env.example .env
+```text
+支付宝截图 → 本地 OCR → 结构化草稿 → 用户确认 → 必要事实/证据 → DeepSeek
 ```
 
-4. 修改 `.env`：
+不把原始截图直接发送给 DeepSeek，也不把 OCR 全文无差别发送给模型。
+
+## 2. 模型配置
+
+模型名必须来自配置，不写死在业务代码中。DeepSeek 模型和别名可能变更；实现时应以接入当天官方 API 文档为准，并在健康页显示实际使用的模型。
+
+建议配置项：
 
 ```dotenv
-FUNDLAB_AI_ENABLED=true
-DEEPSEEK_API_KEY=你的真实Key
+AI_PROVIDER=mock
+DEEPSEEK_API_KEY=
+DEEPSEEK_MODEL=
 DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-v4-flash
-DEEPSEEK_THINKING=false
+DEEPSEEK_TIMEOUT_SECONDS=60
+DEEPSEEK_MAX_RETRIES=2
+DEEPSEEK_ENABLED=false
 ```
 
-5. 检查配置：
+仓库只提交 `.env.example`，不得提交真实 `.env` 或密钥。
 
-```powershell
-fundlab ai-check
+开发和 CI 默认使用 `mock` Provider。只有用户明确启用并配置密钥时才发送外部请求。
+
+## 3. 请求内容
+
+模型请求只包含完成解释所需的：
+
+- 基金代码、正式名称、份额和类型；
+- 研究期限；
+- 已计算指标及其口径；
+- 规则引擎输出；
+- 目标区间与触发条件；
+- 去重后的 Evidence Pack；
+- 未知项；
+- 数据截止日期和语言要求。
+
+不包含：
+
+- 图片；
+- 支付宝账号或设备信息；
+- 完整交易账本；
+- 无关持仓金额；
+- API 密钥；
+- 本地文件路径和数据库连接。
+
+如果解释组合建议确实需要权重，只提供标准化后的必要比例和匿名组合项目，不发送原截图。
+
+## 4. 结构化输出
+
+模型必须返回可校验 JSON，例如：
+
+```json
+{
+  "summary": "当前结论的简洁解释",
+  "supporting_points": [
+    {"text": "支持理由", "evidence_ids": ["ev_001"]}
+  ],
+  "counterpoints": [
+    {"text": "反方观点", "evidence_ids": ["ev_002"]}
+  ],
+  "unknowns": ["尚未披露的项目"],
+  "invalidation_conditions": ["触发重新研究的条件"]
+}
 ```
 
-`ai-check` 只检查本地配置，不会为测试而发送付费请求。真实调用发生在“AI 证据”页面运行结构化分析时。
+服务端校验：
 
-## 可修改设置
+- JSON Schema；
+- 字段长度和枚举；
+- `evidence_id` 必须存在；
+- 不允许模型新增核心数值或操作状态；
+- 不允许保证性措辞；
+- 不合格输出最多按配置重试，之后降级。
 
-所有常用参数位于 `.env`：
+## 5. Prompt 边界
 
-| 变量 | 作用 |
-| --- | --- |
-| `DEEPSEEK_MODEL` | 模型名，升级模型时优先改这里 |
-| `DEEPSEEK_THINKING` | 是否开启思考模式 |
-| `DEEPSEEK_TIMEOUT_SECONDS` | 单次超时 |
-| `DEEPSEEK_MAX_RETRIES` | 失败重试次数 |
-| `DEEPSEEK_MAX_TOKENS` | 最大输出 Token，过低可能截断 JSON |
-| `DEEPSEEK_DAILY_BUDGET_USD` | 本地日预算保护，0 表示关闭 |
-| `DEEPSEEK_*_PRICE_PER_MILLION_USD` | 本地成本估算，价格变化时手动更新 |
+System Prompt 必须说明：
 
-## 代码修改位置
+- 只能解释给定事实；
+- 当前事实不得依赖模型记忆；
+- 不足时明确说未知；
+- 正反证据都要呈现；
+- 不得更改规则结果；
+- 不得给出自动交易指令；
+- 每个事件性结论都要引用 Evidence Pack。
 
-- API 格式或鉴权变化：`src/fundlab/ai/providers/deepseek.py`
-- 模型供应商切换：在 `src/fundlab/ai/providers/` 新建适配器，再修改 `gateway.py`
-- 输出字段变化：`src/fundlab/domain/models.py` 中的 `AIAnalysis`/`AIEvent`
-- Prompt 修改：`prompts/event_analysis/v1_system.md`
-- 安全规则：`src/fundlab/ai/safety.py`
-- 固定流程：`src/fundlab/ai/orchestrator.py`
+用户备注属于不可信输入，不能覆盖系统边界或要求泄露配置。
 
-修改输出 Schema、Prompt 或模型后，必须运行 AI 测试并更新 Prompt 版本，避免旧缓存与新行为混用。
+## 6. 失败与降级
 
-## Mock 降级
+下列情况不阻断确定性报告：
 
-出现以下任一情况时 `build_llm_provider` 使用 Mock：
+- 未配置密钥；
+- 超时或限流；
+- 模型下线或名称失效；
+- Schema 校验失败；
+- 引用不存在；
+- 内容安全或长度限制；
+- Provider 网络不可达。
 
-- `FUNDLAB_AI_ENABLED=false`；
-- `DEEPSEEK_API_KEY` 为空；
-- 测试显式要求 Mock。
+前端显示“AI 解释暂不可用”，保留计算结果、规则结论和错误重试入口。不得用旧缓存解释冒充当前结果；如展示旧内容，必须标注生成时间和对应报告版本。
 
-Mock 不会产生真实判断，只用于验证文档、证据、Schema、缓存和页面链路。
+## 7. 成本、缓存与审计
 
-## 安全说明
+- 对规范化请求做哈希，同一报告版本可复用缓存；
+- 保存模型名、时间、延迟、token 用量、请求模板版本和输出状态；
+- 审计记录不保存密钥；
+- 设置单次和每日软预算；
+- 用户主动重新生成时说明是否会产生外部请求；
+- 模型或 Prompt 版本变化时不覆盖历史运行。
 
-- `.env` 已被 Git 忽略；
-- Key 不写入数据库和日志；
-- 只发送公开证据和匿名化量化摘要；
-- 不向模型发送真实账户金额、身份或支付宝流水；
-- 模型无工具权限；
-- API 失败不会阻止确定性报告生成。
+## 8. 连接测试
 
+设置页“测试 AI”按钮必须：
+
+1. 校验配置是否完整；
+2. 发送不含个人数据的最小请求；
+3. 返回实际模型、响应状态和延迟；
+4. 对错误脱敏；
+5. 不自动开启 AI。
+
+连接成功不代表模型输出已通过业务 Schema；两项状态应分开显示。
