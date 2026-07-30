@@ -11,9 +11,17 @@ build/
 
 # Virtual environments
 .venv/
+.venv-mvp/
 .venv-research/
 
-# Secrets — never commit real API keys
+# Node
+node_modules/
+frontend/dist/
+frontend/playwright-report/
+frontend/test-results/
+*.tsbuildinfo
+
+# Secrets
 .env
 .streamlit/secrets.toml
 
@@ -31,4 +39,3 @@ portfolio_transactions.csv
 .vscode/
 .DS_Store
 Thumbs.db
-
