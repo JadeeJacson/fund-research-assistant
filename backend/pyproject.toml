@@ -3,9 +3,9 @@ requires = ["setuptools>=75", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fundlab-mvp-api"
-version = "0.1.0"
-description = "个人基金研究助手 v1 本地 API"
+name = "fundlab-decision-console"
+version = "2.1.0"
+description = "基金仓位决策台 v2.1 本地 API"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "alembic>=1.14,<2",
@@ -15,6 +15,7 @@ dependencies = [
     "pydantic>=2.10,<3",
     "python-multipart>=0.0.20,<1",
     "python-dotenv>=1,<2",
+    "pyyaml>=6,<7",
     "sqlalchemy>=2.0,<3",
     "uvicorn>=0.34,<1",
 ]
@@ -22,6 +23,7 @@ dependencies = [
 [project.optional-dependencies]
 market = ["akshare>=1.18.64,<2"]
 ocr = [
+    "onnxruntime>=1.20,<2",
     "opencv-python-headless>=4.10,<5",
     "rapidocr>=3.4,<4",
 ]
@@ -36,7 +38,7 @@ where = ["."]
 include = ["app*"]
 
 [tool.pytest.ini_options]
-addopts = "-q"
+addopts = "-q --basetemp=.pytest-tmp"
 testpaths = ["tests"]
 
 [tool.ruff]
@@ -45,4 +47,4 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
-ignore = ["E501"]
+ignore = ["E501", "B008"]

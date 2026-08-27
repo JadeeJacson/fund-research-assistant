@@ -1,902 +1,382 @@
-import { FormEvent, ReactNode, useEffect, useMemo, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import type { FormEvent, ReactNode } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { NavLink, Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
+import { Cell, Legend, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { api } from "./api";
-import type {
-  Candidate,
-  Evidence,
-  Holding,
-  ImportBatch,
-  ImportItem,
-  Page,
-  Report,
-  Transaction,
-  Trigger,
-} from "./types";
+import type { AiConfiguration, AiExplanation, AiSettingsResponse, AiSettingsUpdate, BucketKey, BucketSummary, DataHealth, DiscoveryRun, FundDetail, HoldingSnapshot, ImportBatch, Portfolio, Review, ReviewItem } from "./types";
 
-const NAV: Array<{ id: Page; label: string; icon: string }> = [
-  { id: "dashboard", label: "总览", icon: "◫" },
-  { id: "candidates", label: "候选研究", icon: "◇" },
-  { id: "imports", label: "截图导入", icon: "▣" },
-  { id: "portfolio", label: "持仓交易", icon: "◎" },
-  { id: "triggers", label: "条件触发", icon: "⌁" },
-  { id: "settings", label: "设置", icon: "⚙" },
-];
+const bucketOrder: BucketKey[] = ["defense", "core", "satellite"];
+const bucketLabels: Record<BucketKey, string> = { defense: "流动防守仓", core: "核心配置仓", satellite: "卫星进攻仓" };
+const actionLabels: Record<string, string> = { observe: "继续观察", reduce: "减仓复核", exit_review: "退出复核", compare: "对照替代" };
+const reasonLabels: Record<string, string> = { data_quality: "数据问题", hard_risk: "硬风险", quality_deterioration: "质量恶化", alternative: "替代对照" };
+const bucketColors: Record<BucketKey, string> = { defense: "#247A5A", core: "#5D7E70", satellite: "#B7791F" };
 
-function money(value: number | null | undefined) {
-  return value == null
-    ? "—"
-    : new Intl.NumberFormat("zh-CN", { style: "currency", currency: "CNY" }).format(value);
-}
-
-function percent(value: number | null | undefined) {
-  return value == null ? "—" : `${(value * 100).toFixed(2)}%`;
-}
+function money(value: number) { return new Intl.NumberFormat("zh-CN", { style: "currency", currency: "CNY", maximumFractionDigits: 2 }).format(value); }
+function percent(value: number | null | undefined) { return value == null ? "—" : `${(value * 100).toFixed(1)}%`; }
+function dateText(value: string | null | undefined) { return value ? new Date(value).toLocaleDateString("zh-CN") : "—"; }
+function profitText(value: number | null | undefined) { return value == null ? "未录入" : value > 0 ? `盈利 ${money(value)}` : value < 0 ? `亏损 ${money(Math.abs(value))}` : "持平 ¥0"; }
+function ratioText(value: number | null | undefined) { return value == null ? "—" : value.toFixed(2); }
+function metricTone(value: number | null | undefined, _inverse = false) { if (value == null || value === 0) return "neutral"; return value > 0 ? "positive" : "negative"; }
 
 function Card({ children, className = "" }: { children: ReactNode; className?: string }) {
   return <section className={`card ${className}`}>{children}</section>;
 }
 
-function Notice({ value }: { value: { kind: "ok" | "error"; text: string } | null }) {
-  if (!value) return null;
-  return (
-    <div className={`notice ${value.kind}`} role={value.kind === "error" ? "alert" : "status"}>
-      {value.text}
-    </div>
-  );
+function StatusPill({ value }: { value: string }) {
+  const tone = value === "ready" || value === "completed" || value === "hold" ? "good" : value === "blocked" || value === "failed" || value === "critical" ? "danger" : "warn";
+  const labels: Record<string, string> = { ready: "数据就绪", limited: "数据有限", blocked: "数据阻断", completed: "已完成", partial: "部分完成", running: "评估中", queued: "等待中", failed: "失败", critical: "严重", high: "高", medium: "中", info: "信息" };
+  return <span className={`pill ${tone}`}>{labels[value] ?? value}</span>;
 }
 
-function App() {
-  const [page, setPage] = useState<Page>("dashboard");
-  const [health, setHealth] = useState<Record<string, string | number> | null>(null);
-
-  useEffect(() => {
-    api.get<Record<string, string | number>>("/health").then(setHealth).catch(() => setHealth(null));
-  }, []);
-
-  return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <span className="brand-mark">F</span>
-          <div>
-            <strong>FundLab</strong>
-            <small>个人基金研究助手</small>
-          </div>
-        </div>
-        <nav aria-label="主导航">
-          {NAV.map((item) => (
-            <button
-              className={page === item.id ? "nav-item active" : "nav-item"}
-              key={item.id}
-              onClick={() => setPage(item.id)}
-              type="button"
-            >
-              <span>{item.icon}</span>
-              {item.label}
-            </button>
-          ))}
-        </nav>
-        <div className="sidebar-status">
-          <span className={health ? "status-dot online" : "status-dot"} />
-          <div>
-            <strong>{health ? "本地服务正常" : "正在连接服务"}</strong>
-            <small>
-              {health
-                ? `${String(health.market_provider)} · ${String(health.ocr)}`
-                : "请确认后端已经启动"}
-            </small>
-          </div>
-        </div>
-      </aside>
-      <main className="workspace">
-        {page === "dashboard" && <Dashboard />}
-        {page === "candidates" && <Candidates />}
-        {page === "imports" && <Imports />}
-        {page === "portfolio" && <Portfolio />}
-        {page === "triggers" && <Triggers />}
-        {page === "settings" && <Settings />}
-      </main>
-    </div>
-  );
+function AiExplanationPanel({ runId }: { runId: number }) {
+  const explanation = useMutation({ mutationFn: () => api.post<AiExplanation>(`/reviews/${runId}/explain`) });
+  const result = explanation.data;
+  return <div className="ai-explanation">
+    <div className="ai-explanation-heading"><div><span className="eyebrow">AI EXPLANATION</span><strong>DeepSeek 辅助解释</strong></div><button className="button secondary" disabled={explanation.isPending} onClick={() => explanation.mutate()}>{explanation.isPending ? "正在整理证据…" : result ? "重新读取解释" : "生成 AI 解释"}</button></div>
+    {!result && <p>只发送公开基金身份、匿名指标和已选证据；不会改变确定性结论。</p>}
+    {explanation.error && <div className="notice error">{(explanation.error as Error).message}</div>}
+    {result && result.status !== "ok" && <div className="notice warning">{result.summary}</div>}
+    {result?.status === "ok" && <div className="ai-explanation-result"><p className="ai-summary">{result.summary}</p><div className="ai-point-grid"><div><h3>支持理由</h3>{result.supporting_points.length ? <ul>{result.supporting_points.map((point, index) => <li key={`${point.text}-${index}`}>{point.text}{point.evidence_ids.length > 0 && <small>引用 {point.evidence_ids.join("、")}</small>}</li>)}</ul> : <p>没有额外支持项。</p>}</div><div><h3>反方与限制</h3>{result.counterpoints.length ? <ul>{result.counterpoints.map((point, index) => <li key={`${point.text}-${index}`}>{point.text}{point.evidence_ids.length > 0 && <small>引用 {point.evidence_ids.join("、")}</small>}</li>)}</ul> : <p>没有额外反方项。</p>}</div></div>{result.unknowns.length > 0 && <p className="ai-unknowns">仍未知：{result.unknowns.join("；")}</p>}<small>{result.cached ? "已复用相同评估的缓存解释" : "本次新生成"}</small></div>}
+  </div>;
 }
 
-function PageHeader({
-  eyebrow,
-  title,
-  description,
-  action,
-}: {
-  eyebrow: string;
-  title: string;
-  description: string;
-  action?: ReactNode;
-}) {
-  return (
-    <header className="page-header">
-      <div>
-        <span className="eyebrow">{eyebrow}</span>
-        <h1>{title}</h1>
-        <p>{description}</p>
-      </div>
-      {action}
-    </header>
-  );
+function AllocationDonut({ summary, total }: { summary: Partial<Record<BucketKey, BucketSummary>>; total: number }) {
+  const data = bucketOrder.map((key) => ({ key, name: bucketLabels[key], amount: summary[key]?.amount ?? 0, weight: summary[key]?.weight ?? 0 })).filter((item) => item.amount > 0);
+  if (!data.length) return null;
+  return <Card className="allocation-card"><div className="section-heading"><div><span className="eyebrow">POSITION MIX</span><h2>当前仓位结构</h2></div><strong>{money(total)}</strong></div><div className="allocation-content"><div className="donut-chart" role="img" aria-label="三仓金额比例环状图"><ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={data} dataKey="amount" nameKey="name" innerRadius={62} outerRadius={88} paddingAngle={2} stroke="#FFFDF8" strokeWidth={3}>{data.map((item) => <Cell key={item.key} fill={bucketColors[item.key]} />)}</Pie></PieChart></ResponsiveContainer><div className="donut-center"><strong>{data.length}</strong><span>个有持仓仓位</span></div></div><div className="allocation-legend">{data.map((item) => <div key={item.key}><i style={{ background: bucketColors[item.key] }} /><span><strong>{item.name}</strong><small>{money(item.amount)}</small></span><b>{percent(item.weight)}</b></div>)}</div></div><p className="storage-note">比例按最近完整持仓快照总市值计算，不使用计划投入金额作为分母。</p></Card>;
+}
+
+function Shell({ children }: { children: ReactNode }) {
+  const health = useQuery({ queryKey: ["health"], queryFn: () => api.get<Record<string, string>>("/health"), refetchInterval: 30_000 });
+  const links = [
+    ["/", "决策台", "本次判断与复核"], ["/portfolio", "我的组合", "持仓快照与三仓"],
+    ["/funds", "基金详情", "质量、净值与证据"], ["/alternatives", "基金探索", "主动筛选与替代"],
+    ["/history", "历史与数据", "运行留痕与设置"],
+  ];
+  return <div className="app-shell">
+    <aside className="sidebar">
+      <div className="brand"><div className="brand-mark">仓</div><div><strong>基金仓位决策台</strong><small>个人研究 · 理性决策</small></div></div>
+      <nav aria-label="主要导航">{links.map(([to, label, desc]) => <NavLink key={to} to={to} end={to === "/"} className={({ isActive }) => `nav-item ${isActive ? "active" : ""}`}><span>{label}</span><small>{desc}</small></NavLink>)}</nav>
+      <div className="system-state"><span className={`dot ${health.isSuccess ? "online" : ""}`} /><div><strong>{health.isSuccess ? "本地服务正常" : "正在连接"}</strong><small>{health.data?.rule_version ? `规则 ${health.data.rule_version}` : "等待健康检查"}</small></div></div>
+    </aside>
+    <main className="workspace">{children}</main>
+  </div>;
+}
+
+function PageHeader({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: ReactNode }) {
+  return <header className="page-header"><div><span className="eyebrow">{eyebrow}</span><h1>{title}</h1><p>{description}</p></div>{action}</header>;
 }
 
 function Dashboard() {
-  const [data, setData] = useState<Record<string, number | string | null> | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
-
-  const load = async () => {
-    setLoading(true);
-    setNotice(null);
-    try {
-      setData(await api.get("/dashboard"));
-    } catch (error) {
-      setNotice({ kind: "error", text: (error as Error).message });
-    } finally {
-      setLoading(false);
-    }
-  };
-  useEffect(() => {
-    void load();
-  }, []);
-
-  return (
-    <>
-      <PageHeader
-        eyebrow="LOCAL RESEARCH DESK"
-        title="投资研究总览"
-        description="先看数据质量和风险，再决定是否扩大暴露。"
-        action={
-          <button className="button secondary" onClick={load} disabled={loading} type="button">
-            {loading ? "刷新中…" : "刷新总览"}
-          </button>
-        }
-      />
-      <Notice value={notice} />
-      <div className="metric-grid">
-        <Card>
-          <span className="metric-label">候选基金</span>
-          <strong className="metric-value">{data?.candidate_count ?? "—"}</strong>
-          <small>等待研究或比较</small>
-        </Card>
-        <Card>
-          <span className="metric-label">当前持仓</span>
-          <strong className="metric-value">{data?.holding_count ?? "—"}</strong>
-          <small>按最近快照统计</small>
-        </Card>
-        <Card>
-          <span className="metric-label">实验组合</span>
-          <strong className="metric-value">
-            {typeof data?.portfolio_amount === "number" ? money(data.portfolio_amount) : "—"}
-          </strong>
-          <small>{data?.latest_snapshot_date ? `快照 ${data.latest_snapshot_date}` : "尚无快照"}</small>
-        </Card>
-        <Card className="risk-card">
-          <span className="metric-label">阶段性回撤参考</span>
-          <strong className="metric-value">
-            {typeof data?.risk_tolerance === "number" ? percent(data.risk_tolerance) : "10.00%"}
-          </strong>
-          <small>不是损失保证或自动止损</small>
-        </Card>
+  const client = useQueryClient();
+  const navigate = useNavigate();
+  const portfolio = useQuery({ queryKey: ["portfolio"], queryFn: () => api.get<Portfolio>("/portfolio") });
+  const review = useQuery({
+    queryKey: ["review", "latest"], queryFn: () => api.get<Review | null>("/reviews/latest"),
+    refetchInterval: (query) => { const data = query.state.data as Review | null; return data && ["queued", "running"].includes(data.status) ? 1200 : false; },
+  });
+  const run = useMutation({
+    mutationFn: () => api.post<{ run_id: number }>("/reviews"),
+    onSuccess: () => client.invalidateQueries({ queryKey: ["review"] }),
+  });
+  const latest = review.data;
+  const ready = Boolean(portfolio.data?.latest_snapshot?.completeness === "complete");
+  const headlineItems = latest?.headlines.filter((item) => item.reason_type !== "band_breach") ?? [];
+  const queueItems = latest?.items.filter((item) => item.reason_type !== "band_breach") ?? [];
+  return <>
+    <PageHeader eyebrow="DECISION DESK" title="今天，需要动吗？" description="每次由你主动运行。系统检查数据、硬风险、基金质量和替代项；仓位比例只作展示。" action={<div className="page-actions"><NavLink className="button secondary large" to="/alternatives">探索基金</NavLink><button className="button primary large" disabled={!ready || run.isPending || latest?.status === "running"} onClick={() => run.mutate()}>{run.isPending || latest?.status === "running" ? "正在评估…" : "开始本次评估"}</button></div>} />
+    {!portfolio.data?.latest_snapshot && <Card className="onboarding"><span className="step">首次使用</span><h2>先确认你的完整持仓</h2><p>投入金额可随时修改。录入所有基金并确认这是完整快照后，才能运行基金质量与风险评估。</p><button className="button primary" onClick={() => navigate("/portfolio")}>设置我的组合</button></Card>}
+    {(portfolio.isLoading || review.isLoading) && <Card className="progress-card"><strong>正在读取本地组合与历史评估…</strong></Card>}
+    {(portfolio.error || review.error) && <div className="notice error">{((portfolio.error || review.error) as Error).message}</div>}
+    {run.error && <div className="notice error">{(run.error as Error).message}</div>}
+    {latest && portfolio.data?.rule_version && latest.rule_version !== portfolio.data.rule_version && <div className="notice warning">当前显示的是规则 {latest.rule_version} 的历史结果；现行规则已更新为 {portfolio.data.rule_version}。请点击“开始本次评估”生成新结论，旧记录会保留在历史中。</div>}
+    {portfolio.data?.latest_snapshot && <AllocationDonut summary={portfolio.data.current_bucket_summary ?? {}} total={portfolio.data.latest_snapshot.total_market_value} />}
+    {latest && ["queued", "running"].includes(latest.status) && <Card className="progress-card"><div><strong>评估正在进行</strong><span>{latest.progress}%</span></div><div className="progress"><i style={{ width: `${latest.progress}%` }} /></div><p>正在刷新公开数据、核验事件并运行确定性规则。离开本页不会取消任务。</p></Card>}
+    {latest && !["queued", "running"].includes(latest.status) && <>
+      <Card className={`verdict ${latest.verdict === "hold" ? "hold" : "review"}`}>
+        <div><span className="eyebrow">本次总判断 · {latest.as_of_date}</span><h2>{latest.verdict_label}</h2><p>{latest.verdict === "hold" ? "当前没有足够证据支持调整，继续按计划观察。" : "至少一项数据、硬风险、基金质量或替代条件需要你确认。"}</p></div>
+        <div className="verdict-meta"><StatusPill value={latest.data_quality} /><span>规则 {latest.rule_version}</span><span>{latest.status === "partial" ? "部分基金被数据门阻断" : "结果已保存"}</span></div>
+      </Card>
+      <div className="bucket-grid">{bucketOrder.map((key) => { const item = latest.bucket_summary[key]; if (!item) return null; return <Card key={key} className={`bucket-card ${key}`}><div className="bucket-heading"><span>{item.label}</span><span className={`pill ${item.in_band ? "good" : "warn"}`}>{item.in_band ? "区间内" : "区间外 · 仅展示"}</span></div><strong className="bucket-value">{percent(item.weight)}</strong><div className="bucket-track"><i style={{ width: `${Math.min(item.weight * 100, 100)}%` }} /></div><div className="bucket-foot"><span>{money(item.amount)}</span><span>目标 {percent(item.low)}～{percent(item.high)}</span></div></Card>; })}</div>
+      <div className="dashboard-grid">
+        <Card><div className="section-heading"><div><span className="eyebrow">TOP EVIDENCE</span><h2>最需要看的三件事</h2></div><span>{headlineItems.length} 条</span></div>{headlineItems.length ? <div className="headline-list">{headlineItems.map((item, index) => <article key={`${item.title}-${index}`}><span className="number">0{index + 1}</span><div><strong>{item.title}</strong><p>{item.detail}</p></div><StatusPill value={item.severity} /></article>)}</div> : <p className="empty">本次没有触发强证据。</p>}</Card>
+        <Card><div className="section-heading"><div><span className="eyebrow">REVIEW QUEUE</span><h2>复核队列</h2></div><span>{queueItems.length} 项</span></div>{queueItems.length ? <div className="review-list">{queueItems.slice(0, 5).map((item) => <ReviewRow key={item.id} item={item} compact />)}</div> : <p className="empty">没有待复核事项。</p>}</Card>
       </div>
-      <div className="two-column">
-        <Card>
-          <div className="card-heading">
-            <div>
-              <span className="eyebrow">WORKFLOW</span>
-              <h2>建议工作顺序</h2>
-            </div>
-          </div>
-          <ol className="workflow-list">
-            <li><span>01</span><div><strong>建立候选</strong><p>输入基金代码，或从支付宝自选截图导入。</p></div></li>
-            <li><span>02</span><div><strong>刷新公开数据</strong><p>截图只描述你的状态，基金研究依赖公开数据。</p></div></li>
-            <li><span>03</span><div><strong>选择研究期限</strong><p>2～3 个月和约 1 年分别运行规则。</p></div></li>
-            <li><span>04</span><div><strong>校对个人数据</strong><p>OCR 结果确认后才能进入持仓和交易。</p></div></li>
-          </ol>
-        </Card>
-        <Card>
-          <div className="card-heading">
-            <div>
-              <span className="eyebrow">REVIEW QUEUE</span>
-              <h2>待处理事项</h2>
-            </div>
-          </div>
-          <div className="review-count">
-            <strong>{data?.pending_imports ?? "—"}</strong>
-            <span>个截图批次等待人工确认</span>
-          </div>
-          <p className="muted">
-            低置信度、截断名称、金额/份额和交易时间必须校对。未确认草稿不会参与任何建议。
-          </p>
-        </Card>
-      </div>
-    </>
-  );
+      <Card><AiExplanationPanel runId={latest.id} /></Card>
+    </>}
+    {!latest && portfolio.data?.latest_snapshot && <Card className="empty-state"><h2>持仓已准备好</h2><p>点击“开始本次评估”，首次结论会保存到历史记录中。</p></Card>}
+  </>;
 }
 
-function Candidates() {
-  const [items, setItems] = useState<Candidate[]>([]);
-  const [code, setCode] = useState("");
-  const [note, setNote] = useState("");
-  const [busy, setBusy] = useState("");
-  const [report, setReport] = useState<Report | null>(null);
-  const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
+type DraftRow = { fund_code: string; fund_name: string; amount: string; displayed_profit: string; bucket: BucketKey };
+const blankRow = (): DraftRow => ({ fund_code: "", fund_name: "", amount: "", displayed_profit: "", bucket: "satellite" });
 
-  const load = async () => {
-    setItems(await api.get<Candidate[]>("/candidates"));
-  };
-  useEffect(() => {
-    load().catch((error) => setNotice({ kind: "error", text: (error as Error).message }));
-  }, []);
-
-  const add = async (event: FormEvent) => {
-    event.preventDefault();
-    setBusy("add");
-    setNotice(null);
-    try {
-      await api.post("/candidates", { fund_code: code, note });
-      setCode("");
-      setNote("");
-      await load();
-      setNotice({ kind: "ok", text: "候选基金已保存，可以刷新公开数据。" });
-    } catch (error) {
-      setNotice({ kind: "error", text: (error as Error).message });
-    } finally {
-      setBusy("");
-    }
-  };
-
-  const act = async (candidate: Candidate, action: "refresh" | "short" | "long" | "delete") => {
-    setBusy(`${action}-${candidate.id}`);
-    setNotice(null);
-    try {
-      if (action === "refresh") {
-        await api.post(`/candidates/${candidate.id}/refresh`);
-        await load();
-        setNotice({ kind: "ok", text: `${candidate.fund_code} 的公开数据已刷新。` });
-      } else if (action === "delete") {
-        if (!window.confirm(`确认删除候选“${candidate.fund_name}”吗？`)) return;
-        await api.delete(`/candidates/${candidate.id}`);
-        if (report?.candidate.id === candidate.id) setReport(null);
-        await load();
-      } else {
-        setReport(
-          await api.post<Report>("/reports", {
-            candidate_id: candidate.id,
-            horizon: action,
-          }),
-        );
-      }
-    } catch (error) {
-      setNotice({ kind: "error", text: (error as Error).message });
-    } finally {
-      setBusy("");
-    }
-  };
-
-  return (
-    <>
-      <PageHeader
-        eyebrow="CANDIDATE LAB"
-        title="候选基金研究"
-        description="基金详情优先来自公开数据；支付宝截图用于确认你真正关注或持有的标的。"
-      />
-      <Notice value={notice} />
-      <Card>
-        <form className="inline-form" onSubmit={add}>
-          <label>
-            六位基金代码
-            <input
-              aria-label="六位基金代码"
-              value={code}
-              onChange={(event) => setCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
-              pattern="\d{6}"
-              placeholder="例如 017470"
-              required
-            />
-          </label>
-          <label className="grow">
-            关注原因
-            <input
-              value={note}
-              onChange={(event) => setNote(event.target.value)}
-              placeholder="可选：为什么关注这只基金"
-            />
-          </label>
-          <button className="button primary" disabled={busy === "add"} type="submit">
-            {busy === "add" ? "保存中…" : "加入候选"}
-          </button>
-        </form>
-      </Card>
-      <div className="candidate-layout">
-        <div className="stack">
-          {items.length === 0 && <Card><p className="empty">还没有候选基金，请先输入代码。</p></Card>}
-          {items.map((candidate) => (
-            <Card key={candidate.id} className="candidate-card">
-              <div className="candidate-title">
-                <div>
-                  <span className="code">{candidate.fund_code}</span>
-                  <h2>{candidate.fund_name}</h2>
-                  <div className="tag-row">
-                    <span className="tag">{candidate.fund_type}</span>
-                    {candidate.share_class && <span className="tag">{candidate.share_class} 类份额</span>}
-                    <span className={candidate.data_source.includes("演示") ? "tag warning" : "tag"}>
-                      {candidate.data_source}
-                    </span>
-                  </div>
-                </div>
-                <div className="nav-value">
-                  <strong>{candidate.latest_nav?.toFixed(4) ?? "未刷新"}</strong>
-                  <small>{candidate.nav_date ?? "无净值日期"}</small>
-                </div>
-              </div>
-              {candidate.note && <p className="note">{candidate.note}</p>}
-              <div className="action-row">
-                <button
-                  className="button secondary"
-                  disabled={Boolean(busy)}
-                  onClick={() => act(candidate, "refresh")}
-                  type="button"
-                >
-                  {busy === `refresh-${candidate.id}` ? "刷新中…" : "刷新公开数据"}
-                </button>
-                <button
-                  className="button primary"
-                  disabled={Boolean(busy)}
-                  onClick={() => act(candidate, "short")}
-                  type="button"
-                >
-                  研究 2～3 个月
-                </button>
-                <button
-                  className="button primary"
-                  disabled={Boolean(busy)}
-                  onClick={() => act(candidate, "long")}
-                  type="button"
-                >
-                  研究约 1 年
-                </button>
-                <button
-                  className="button danger"
-                  disabled={Boolean(busy)}
-                  onClick={() => act(candidate, "delete")}
-                  type="button"
-                >
-                  删除
-                </button>
-              </div>
-            </Card>
-          ))}
-        </div>
-        <ReportPanel report={report} />
-      </div>
-    </>
-  );
+function snapshotRows(snapshot: HoldingSnapshot | null | undefined): DraftRow[] {
+  return snapshot?.items.map((item) => ({ fund_code: item.fund_code, fund_name: item.fund_name, amount: item.amount.toString(), displayed_profit: item.displayed_profit?.toString() ?? "", bucket: item.bucket })) ?? [];
 }
 
-function ReportPanel({ report }: { report: Report | null }) {
-  if (!report) {
-    return (
-      <Card className="report-panel">
-        <span className="eyebrow">ANALYSIS</span>
-        <h2>研究报告</h2>
-        <p className="empty">选择候选基金并运行一个期限，结果会显示在这里。</p>
-      </Card>
-    );
+function mergeOcrRows(existing: DraftRow[], incoming: ImportBatch["items"]): { rows: DraftRow[]; updated: number; added: number } {
+  const merged = new Map(existing.filter((row) => row.fund_code).map((row) => [row.fund_code, row]));
+  let updated = 0;
+  let added = 0;
+  for (const item of incoming) {
+    if (!item.fund_code) continue;
+    const previous = merged.get(item.fund_code);
+    const incomingName = item.fund_name && !item.fund_name.startsWith("待刷新基金") ? item.fund_name : "";
+    if (previous) {
+      merged.set(item.fund_code, {
+        ...previous,
+        fund_name: incomingName || previous.fund_name,
+        amount: item.amount == null ? previous.amount : item.amount.toString(),
+        displayed_profit: item.displayed_profit == null ? previous.displayed_profit : item.displayed_profit.toString(),
+      });
+      updated += 1;
+    } else {
+      merged.set(item.fund_code, {
+        fund_code: item.fund_code,
+        fund_name: incomingName || item.fund_name,
+        amount: item.amount?.toString() ?? "",
+        displayed_profit: item.displayed_profit?.toString() ?? "",
+        bucket: item.bucket,
+      });
+      added += 1;
+    }
   }
-  return <ReportContents key={report.report_id} initialReport={report} />;
+  return { rows: [...merged.values()], updated, added };
 }
 
-function ReportContents({ initialReport }: { initialReport: Report }) {
-  const [report, setReport] = useState(initialReport);
-  const [evidence, setEvidence] = useState<Evidence[]>([]);
-  const [busy, setBusy] = useState("");
-  const [error, setError] = useState("");
-  const [form, setForm] = useState({
-    title: "",
-    source_url: "",
-    published_at: new Date().toISOString().slice(0, 10),
-    trust_level: "B",
-    content: "",
+function PortfolioPage() {
+  const client = useQueryClient();
+  const query = useQuery({ queryKey: ["portfolio"], queryFn: () => api.get<Portfolio>("/portfolio") });
+  const imports = useQuery({ queryKey: ["imports"], queryFn: () => api.get<ImportBatch[]>("/imports") });
+  const [budget, setBudget] = useState("");
+  const [rows, setRows] = useState<DraftRow[]>([blankRow()]);
+  const [complete, setComplete] = useState(true);
+  const [source, setSource] = useState<"manual" | "ocr">("manual");
+  const [batchId, setBatchId] = useState<number | null>(null);
+  const [ocrResult, setOcrResult] = useState<ImportBatch | null>(null);
+  const [notice, setNotice] = useState("");
+  const ocrResultRef = useRef<HTMLDivElement>(null);
+  useEffect(() => { if (query.data) setBudget(query.data.capital_budget.toString()); }, [query.data?.capital_budget]);
+  const applyOcrResult = (data: ImportBatch) => {
+    const existing = snapshotRows(query.data?.latest_snapshot);
+    const merged = mergeOcrRows(existing, data.items);
+    setRows(merged.rows.length ? merged.rows : [blankRow()]);
+    setComplete(false);
+    setSource("ocr");
+    setBatchId(data.id);
+    setOcrResult(data);
+    setNotice(data.items.length ? `OCR 已提取 ${data.items.length} 条：更新已有持仓 ${merged.updated} 条，新增 ${merged.added} 条，并已自动归仓。未出现在截图中的原持仓已保留，请核对后再确认完整快照。` : "OCR 已读取图片文字，但没有找到可安全确认的具体基金；原持仓已保留，请查看原因和原始文本");
+    client.invalidateQueries({ queryKey: ["imports"] });
+    window.requestAnimationFrame(() => ocrResultRef.current?.scrollIntoView?.({ behavior: "smooth", block: "start" }));
+  };
+  const saveBudget = useMutation({ mutationFn: () => api.put<Portfolio>("/portfolio", { name: "我的实验组合", capital_budget: Number(budget) }), onSuccess: (data) => { setNotice("预算已保存"); client.setQueryData(["portfolio"], data); } });
+  const saveSnapshot = useMutation({
+    mutationFn: () => {
+      const payload = {
+        as_of_date: new Date().toISOString().slice(0, 10),
+        completeness: complete ? "complete" : "partial",
+        items: rows.filter((row) => row.fund_code && Number(row.amount) > 0).map((row) => ({ ...row, amount: Number(row.amount), displayed_profit: row.displayed_profit.trim() === "" ? null : Number(row.displayed_profit) })),
+      };
+      return source === "ocr" && batchId
+        ? api.post<HoldingSnapshot>(`/imports/${batchId}/confirm`, payload)
+        : api.post<HoldingSnapshot>("/portfolio/snapshots", { ...payload, source });
+    },
+    onSuccess: () => { setNotice(complete ? "完整持仓快照已确认，可以开始评估；明细已显示在下方列表" : "部分快照已保存，不会参与仓位判断"); setBatchId(null); client.invalidateQueries({ queryKey: ["portfolio"] }); client.invalidateQueries({ queryKey: ["imports"] }); },
   });
-  const decision = report.decision;
-  const loadEvidence = async () => {
-    setEvidence(await api.get<Evidence[]>(`/evidence?candidate_id=${report.candidate.id}`));
+  const upload = useMutation({
+    mutationFn: async (file: File) => { const batch = await api.upload<{ id: number }>("/imports", file); return api.post<ImportBatch>(`/imports/${batch.id}/process`); },
+    onSuccess: applyOcrResult,
+  });
+  const reprocess = useMutation({
+    mutationFn: (id: number) => api.post<ImportBatch>(`/imports/${id}/process`),
+    onSuccess: applyOcrResult,
+  });
+  const total = rows.reduce((sum, row) => sum + (Number(row.amount) || 0), 0);
+  const updateRow = (index: number, patch: Partial<DraftRow>) => setRows((current) => current.map((row, rowIndex) => rowIndex === index ? { ...row, ...patch } : row));
+  const selectedImport = ocrResult ?? imports.data?.[0] ?? null;
+  const loadSnapshot = (snapshot: HoldingSnapshot) => {
+    setRows(snapshotRows(snapshot));
+    setSource("manual");
+    setBatchId(null);
+    setNotice("已把最近持仓载入校对表；修改后需要重新确认快照");
   };
-  useEffect(() => {
-    loadEvidence().catch((reason) => setError((reason as Error).message));
-  }, [report.candidate.id]);
-  const addEvidence = async (event: FormEvent) => {
-    event.preventDefault(); setBusy("evidence"); setError("");
-    try {
-      await api.post("/evidence", { ...form, candidate_id: report.candidate.id });
-      setForm({ ...form, title: "", source_url: "", content: "" });
-      await loadEvidence();
-    } catch (reason) { setError((reason as Error).message); } finally { setBusy(""); }
-  };
-  const removeEvidence = async (id: number) => {
-    if (!window.confirm("确认删除这条证据吗？")) return;
-    try { await api.delete(`/evidence/${id}`); await loadEvidence(); } catch (reason) { setError((reason as Error).message); }
-  };
-  const explain = async () => {
-    setBusy("explain"); setError("");
-    try { setReport(await api.post<Report>(`/reports/${report.report_id}/explain`)); }
-    catch (reason) { setError((reason as Error).message); } finally { setBusy(""); }
-  };
-  return (
-    <Card className="report-panel">
-      <span className="eyebrow">REPORT #{report.report_id}</span>
-      <div className="report-state">
-        <div>
-          <small>{report.horizon === "short" ? "2～3 个月" : "约 1 年"}</small>
-          <h2>{decision.state}</h2>
-        </div>
-        <span className="confidence">置信度 {decision.confidence}</span>
-      </div>
-      <div className="range">
-        <span>建议占实验组合</span>
-        <strong>{percent(decision.target_weight[0])} ～ {percent(decision.target_weight[1])}</strong>
-      </div>
-      <div className="mini-metrics">
-        <div><span>近 3 月</span><strong>{percent(report.metrics.return_3m as number | null)}</strong></div>
-        <div><span>近 1 年</span><strong>{percent(report.metrics.return_1y as number | null)}</strong></div>
-        <div><span>最大回撤</span><strong>{percent(report.metrics.max_drawdown as number | null)}</strong></div>
-        <div><span>年化波动</span><strong>{percent(report.metrics.volatility as number | null)}</strong></div>
-      </div>
-      <h3>支持理由</h3>
-      <ul>{decision.positive_points.length ? decision.positive_points.map((item) => <li key={item}>{item}</li>) : <li>暂无足够支持证据</li>}</ul>
-      <h3>风险与反方</h3>
-      <ul>{[...decision.risk_points, ...decision.unknowns].map((item) => <li key={item}>{item}</li>)}</ul>
-      <h3>条件与有效期</h3>
-      <ul>{decision.triggers.map((item) => <li key={item.description}>{item.description}</li>)}</ul>
-      <p className="muted">数据截止 {report.as_of_date}，建议默认 {decision.valid_days} 天后复核。</p>
-      <p className="disclaimer">{decision.disclaimer}</p>
-      <div className="evidence-section">
-        <h3>Evidence Pack</h3>
-        {error && <p className="field-error">{error}</p>}
-        {evidence.map((item) => (
-          <div className="evidence-item" key={item.id}>
-            <a href={item.source_url} target="_blank" rel="noreferrer">{item.title}</a>
-            <span>{item.trust_level} 级 · {item.published_at}</span>
-            <button aria-label={`删除证据 ${item.title}`} onClick={() => removeEvidence(item.id)} type="button">×</button>
-          </div>
-        ))}
-        <details>
-          <summary>添加公开证据</summary>
-          <form className="form-grid evidence-form" onSubmit={addEvidence}>
-            <label className="span-two">标题<input value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} required /></label>
-            <label className="span-two">来源 URL<input type="url" value={form.source_url} onChange={(e) => setForm({ ...form, source_url: e.target.value })} required /></label>
-            <label>发布日期<input type="date" value={form.published_at} onChange={(e) => setForm({ ...form, published_at: e.target.value })} required /></label>
-            <label>可信等级<select value={form.trust_level} onChange={(e) => setForm({ ...form, trust_level: e.target.value })}><option value="S">S 官方/法定</option><option value="A">A 专业结构化</option><option value="B">B 可靠媒体</option><option value="C">C 待核验线索</option></select></label>
-            <label className="span-two">证据正文<textarea value={form.content} onChange={(e) => setForm({ ...form, content: e.target.value })} minLength={10} required /></label>
-            <button className="button secondary" disabled={busy !== ""} type="submit">{busy === "evidence" ? "保存中…" : "保存证据"}</button>
-          </form>
-        </details>
-        <button className="button primary" disabled={busy !== "" || evidence.length === 0} onClick={explain} type="button">
-          {busy === "explain" ? "生成中…" : "用已保存证据生成 AI 解释"}
-        </button>
-        {report.ai_explanation && (
-          <div className="ai-box">
-            <span className="eyebrow">AI · {report.ai_explanation.status}</span>
-            <p>{report.ai_explanation.summary ?? "尚无解释"}</p>
-          </div>
-        )}
-      </div>
+  return <>
+    <PageHeader eyebrow="PORTFOLIO" title="我的组合" description="这里只保存当前持仓快照，不保存逐笔交易。只有你确认的完整快照才会参与判断。" />
+    {notice && <div className="notice">{notice}</div>}
+    {query.data?.latest_draft && <div className="notice">存在 {dateText(query.data.latest_draft.as_of_date)} 的部分快照草稿；它不会覆盖最近的完整持仓，也不会参与评估。</div>}
+    <div className="portfolio-top">
+      <Card><span className="eyebrow">CAPITAL BUDGET</span><h2>计划投入金额</h2><div className="budget-input"><span>¥</span><input aria-label="计划投入金额" type="number" min="100" value={budget} onChange={(event) => setBudget(event.target.value)} placeholder="自行填写" /><button className="button secondary" onClick={() => saveBudget.mutate()} disabled={saveBudget.isPending || Number(budget) < 100}>保存</button></div>{query.data?.latest_snapshot && <button className="text-button" type="button" onClick={() => setBudget(query.data!.latest_snapshot!.total_market_value.toString())}>按最近快照金额填入</button>}<p>这是可修改的计划值，不作为仓位比例分母；仓位比例始终按最近完整快照总市值计算。</p></Card>
+      <Card><span className="eyebrow">LATEST SNAPSHOT</span><h2>最近快照</h2><strong className="big-number">{query.data?.latest_snapshot ? money(query.data.latest_snapshot.total_market_value) : "尚未录入"}</strong><p>{query.data?.latest_snapshot ? `${dateText(query.data.latest_snapshot.as_of_date)} · ${query.data.latest_snapshot.completeness === "complete" ? "完整" : "部分"}快照` : "完成下方录入后即可运行评估"}</p></Card>
+      <Card><span className="eyebrow">SCREENSHOT OCR</span><h2>从支付宝截图开始</h2><label className="file-button"><input type="file" disabled={query.isLoading || upload.isPending || reprocess.isPending} accept="image/png,image/jpeg,image/webp" onChange={(event) => { const file = event.target.files?.[0]; if (file) upload.mutate(file); }} /><span>{query.isLoading ? "正在读取原持仓…" : upload.isPending || reprocess.isPending ? "正在识别…" : "选择持仓截图"}</span></label><p>支持从中文名称核对基金代码并自动归仓；同代码会更新原行，草稿仍须人工核对。</p></Card>
+    </div>
+    {query.data?.latest_snapshot && <Card className="confirmed-holdings"><div className="section-heading"><div><span className="eyebrow">CONFIRMED SNAPSHOT</span><h2>当前已确认持仓</h2></div><div className="section-actions"><span>{query.data.latest_snapshot.items.length} 只 · {money(query.data.latest_snapshot.total_market_value)}</span><button className="button secondary" onClick={() => loadSnapshot(query.data!.latest_snapshot!)}>载入后修改</button></div></div>
+      <div className="holding-table confirmed-table"><div className="holding-row table-head"><span>基金代码</span><span>基金名称</span><span>当前金额</span><span>个人持有收益</span><span>职责归仓</span><span>查看</span></div>{query.data.latest_snapshot.items.map((item) => <div className="holding-row" key={item.id}><strong>{item.fund_code}</strong><span>{item.fund_name || `待刷新基金 ${item.fund_code}`}</span><span>{money(item.amount)}</span><span className={item.displayed_profit == null ? "profit unknown" : item.displayed_profit >= 0 ? "profit positive" : "profit negative"}>{profitText(item.displayed_profit)}</span><span>{bucketLabels[item.bucket]}</span><NavLink to={`/funds/${item.fund_code}`}>详情</NavLink></div>)}</div>
+      <p className="storage-note">该列表来自快照 #{query.data.latest_snapshot.id}，保存在本机 <code>data/private/fundlab_v2.sqlite3</code>。</p>
+    </Card>}
+    {(selectedImport || imports.isLoading) && <div ref={ocrResultRef}><Card className="ocr-result"><div className="section-heading"><div><span className="eyebrow">OCR RESULT</span><h2>截图识别结果</h2></div>{selectedImport && <div className="section-actions"><span>批次 #{selectedImport.id} · {selectedImport.status === "confirmed" ? "已确认" : selectedImport.status === "needs_review" ? "待校对" : selectedImport.status}</span><button className="button secondary" type="button" disabled={reprocess.isPending} onClick={() => reprocess.mutate(selectedImport.id)}>{reprocess.isPending ? "正在重新识别…" : "重新识别此截图"}</button></div>}</div>
+      {imports.isLoading && <p>正在读取本地 OCR 历史…</p>}
+      {selectedImport && <><div className="ocr-summary"><strong>{selectedImport.items.length} 条结构化基金记录</strong><span>页面判断：{selectedImport.page_type === "holdings" ? "持仓页" : selectedImport.page_type === "candidates" ? "自选/候选页" : "未能确认页面类型"}</span><span>文件：{selectedImport.filename}</span></div>
+        {selectedImport.items.length === 0 && <div className="notice warning">OCR 已读取图片文字，但没有可靠匹配到具体基金。常见原因是截图没有六位代码、名称被截断，或“余额宝”等平台产品没有显示底层基金。可点击“重新识别此截图”；仍未匹配时请补充基金代码。</div>}
+        {selectedImport.items.length > 0 && <div className="ocr-item-list">{selectedImport.items.map((item) => <article key={item.id}><div><strong>{item.fund_name}</strong><span>{item.fund_code} · {bucketLabels[item.bucket]} · 名称/文字置信度 {(item.confidence * 100).toFixed(0)}%</span></div><div><strong>{item.amount == null ? "金额待补充" : money(item.amount)}</strong><span>{profitText(item.displayed_profit)}</span></div><p>{item.issues}</p></article>)}</div>}
+        {selectedImport.items.some((item) => item.displayed_profit != null) && <div className="notice">已识别到个人持有收益。它只用于展示你的当前收益状态，不参与基金质量或调仓判断。</div>}
+        <details className="ocr-raw" open={ocrResult?.id === selectedImport.id}><summary>查看 OCR 原始识别文本</summary><pre>{selectedImport.raw_text || "没有识别到文字"}</pre></details>
+        <p className="storage-note">原图保存在本机 <code>data/private/uploads-v2/</code>，识别文本、置信度和人工修订记录保存在 v2 数据库，不会发送给 DeepSeek。</p></>}
+      {imports.data && imports.data.length > 1 && <details className="import-history"><summary>查看其他导入批次（{imports.data.length - 1}）</summary><div>{imports.data.slice(1).map((item) => <button type="button" key={item.id} onClick={() => { setOcrResult(item); window.requestAnimationFrame(() => ocrResultRef.current?.scrollIntoView?.({ behavior: "smooth", block: "start" })); }}>#{item.id} · {item.filename} · {item.items.length} 条</button>)}</div></details>}
+    </Card></div>}
+    <Card className="snapshot-editor"><div className="section-heading"><div><span className="eyebrow">{source === "ocr" ? "OCR REVIEW DRAFT" : "MANUAL HOLDINGS"}</span><h2>{source === "ocr" ? `校对 OCR 草稿${batchId ? ` #${batchId}` : ""}` : "录入当前全部持仓"}</h2></div><strong>合计 {money(total)}</strong></div>
+      <div className="holding-table"><div className="holding-row table-head"><span>基金代码</span><span>基金名称</span><span>当前金额</span><span>持有收益（可选）</span><span>职责归仓</span><span /></div>{rows.map((row, index) => <div className="holding-row" key={`${row.fund_code}-${index}`}><input aria-label={`基金代码 ${index + 1}`} inputMode="numeric" maxLength={6} value={row.fund_code} onChange={(event) => updateRow(index, { fund_code: event.target.value.replace(/\D/g, "") })} placeholder="六位代码" /><input aria-label={`基金名称 ${index + 1}`} value={row.fund_name} onChange={(event) => updateRow(index, { fund_name: event.target.value })} placeholder="可留空，评估时刷新" /><input aria-label={`持仓金额 ${index + 1}`} type="number" min="0" value={row.amount} onChange={(event) => updateRow(index, { amount: event.target.value })} placeholder="元" /><input aria-label={`持有收益 ${index + 1}`} type="number" step="0.01" value={row.displayed_profit} onChange={(event) => updateRow(index, { displayed_profit: event.target.value })} placeholder="可不填；亏损填负数" /><select aria-label={`职责归仓 ${index + 1}`} value={row.bucket} onChange={(event) => updateRow(index, { bucket: event.target.value as BucketKey })}>{bucketOrder.map((key) => <option value={key} key={key}>{bucketLabels[key]}</option>)}</select><button className="icon-button" aria-label={`删除第 ${index + 1} 行`} onClick={() => setRows((current) => current.filter((_, rowIndex) => rowIndex !== index))}>×</button></div>)}</div>
+      <div className="editor-actions"><button className="button secondary" onClick={() => setRows((current) => [...current, blankRow()])}>添加一只基金</button><label className="check"><input type="checkbox" checked={complete} onChange={(event) => setComplete(event.target.checked)} />我确认这是当前全部持仓</label><button className="button primary" disabled={saveSnapshot.isPending || !rows.some((row) => row.fund_code.length === 6 && Number(row.amount) > 0)} onClick={() => { if (!complete || window.confirm("确认这份快照包含当前全部持仓？保存后它将参与仓位评估。")) saveSnapshot.mutate(); }}>{saveSnapshot.isPending ? "正在保存…" : "确认持仓快照"}</button></div>
+      {(query.error || saveBudget.error || saveSnapshot.error || upload.error || reprocess.error) && <div className="notice error">{((query.error || saveBudget.error || saveSnapshot.error || upload.error || reprocess.error) as Error).message}</div>}
     </Card>
-  );
+  </>;
 }
 
-function Imports() {
-  const [batches, setBatches] = useState<ImportBatch[]>([]);
-  const [selectedId, setSelectedId] = useState<number | null>(null);
-  const [file, setFile] = useState<File | null>(null);
-  const [busy, setBusy] = useState("");
-  const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
-  const selected = batches.find((batch) => batch.id === selectedId) ?? null;
+function FundPage() {
+  const params = useParams();
+  const navigate = useNavigate();
+  const client = useQueryClient();
+  const [input, setInput] = useState(params.code ?? "");
+  const code = params.code && /^\d{6}$/.test(params.code) ? params.code : "";
+  const query = useQuery({ queryKey: ["fund", code], queryFn: () => api.get<FundDetail>(`/funds/${code}`), enabled: Boolean(code), retry: false });
+  const refresh = useMutation({ mutationFn: () => api.post<FundDetail>(`/funds/${code}/refresh`), onSuccess: (data) => client.setQueryData(["fund", code], data) });
+  return <>
+    <PageHeader eyebrow="FUND RESEARCH" title="基金详情" description="区分公开事实、确定性计算、事件证据与未知项。单位净值不被解释为便宜或昂贵。" action={<form className="code-search" onSubmit={(event) => { event.preventDefault(); if (/^\d{6}$/.test(input)) navigate(`/funds/${input}`); }}><input aria-label="基金代码" value={input} onChange={(event) => setInput(event.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="输入六位基金代码" /><button className="button primary">查看</button></form>} />
+    {!code && <Card className="empty-state"><h2>输入一只基金代码</h2><p>可以查看当前数据库中的事实；若尚未刷新，页面会提供真实公开数据刷新按钮。</p></Card>}
+    {code && query.isLoading && <Card className="progress-card"><strong>正在读取基金事实与净值…</strong></Card>}
+    {code && query.isError && <Card className="empty-state"><h2>尚未建立基金档案</h2><p>{(query.error as Error).message}</p><button className="button primary" onClick={() => refresh.mutate()} disabled={refresh.isPending}>{refresh.isPending ? "正在连接公开数据…" : "刷新真实公开数据"}</button>{refresh.error && <div className="notice error">{(refresh.error as Error).message}</div>}</Card>}
+    {query.data?.warning && <div className="notice">{query.data.warning}</div>}
+    {query.data && <FundDetailView detail={query.data} refresh={() => refresh.mutate()} refreshing={refresh.isPending} />}
+  </>;
+}
 
-  const load = async (prefer?: number) => {
-    const values = await api.get<ImportBatch[]>("/imports");
-    setBatches(values);
-    if (prefer) setSelectedId(prefer);
-    else if (!selectedId && values[0]) setSelectedId(values[0].id);
-  };
+function FundDetailView({ detail, refresh, refreshing }: { detail: FundDetail; refresh: () => void; refreshing: boolean }) {
+  const fund = detail.fund;
+  const metrics = detail.performance;
+  return <>
+    <Card className="fund-hero"><div><div className="tag-row"><span className="pill neutral">{fund.code}</span><span className="pill neutral">{fund.fund_type}</span><StatusPill value={fund.quality_status} /></div><h2>{fund.name}</h2><p>{fund.peer_key || "同类尚未确认"} · 数据截至 {dateText(fund.value_date)}</p></div><button className="button secondary" onClick={refresh} disabled={refreshing}>{refreshing ? "刷新中…" : "刷新公开数据"}</button></Card>
+    <div className="fund-grid">
+      <Card><div className="section-heading"><div><span className="eyebrow">TOTAL RETURN & DRAWDOWN</span><h2>近一年基金表现</h2></div><span>{metrics ? `截至 ${dateText(metrics.as_of_date)}` : "累计净值不足"}</span></div>{detail.performance_chart.length ? <div className="chart performance-chart" role="img" aria-label="近一年累计收益率和回撤百分比走势图"><ResponsiveContainer width="100%" height="100%"><LineChart data={detail.performance_chart} margin={{ top: 8, right: 12, bottom: 4, left: 2 }}><XAxis dataKey="date" minTickGap={40} tickLine={false} axisLine={false} tick={{ fontSize: 10 }} /><YAxis width={54} tickLine={false} axisLine={false} tickFormatter={(value) => `${(Number(value) * 100).toFixed(0)}%`} /><Tooltip formatter={(value, name) => [`${(Number(value) * 100).toFixed(2)}%`, name]} labelFormatter={(label) => `日期 ${label}`} /><Legend /><Line name="累计收益率" type="monotone" dataKey="cumulative_return" stroke="#247A5A" strokeWidth={2.4} dot={false} /><Line name="同期回撤" type="monotone" dataKey="drawdown" stroke="#B4473A" strokeWidth={1.7} strokeDasharray="5 4" dot={false} /></LineChart></ResponsiveContainer></div> : <p className="empty">没有足够的累计净值，暂不生成收益率和回撤图。</p>}<p>以窗口首个累计净值归零，展示基金自身收益，不是你的个人持有收益。口径：{fund.return_method || "累计净值"}。</p></Card>
+      <Card><span className="eyebrow">FUND FACTS</span><h2>产品事实</h2><dl className="fact-list"><div><dt>默认职责</dt><dd>{bucketLabels[fund.default_bucket]}</dd></div><div><dt>同类分位</dt><dd>{fund.peer_percentile == null ? "未知" : `${fund.peer_percentile.toFixed(1)}`}</dd></div><div><dt>资产规模</dt><dd>{fund.aum_yi == null ? "未知" : `${fund.aum_yi.toFixed(2)} 亿元`}</dd></div><div><dt>费率</dt><dd>{percent(fund.expense_ratio)}</dd></div><div><dt>申购 / 赎回</dt><dd>{fund.purchase_status} / {fund.redemption_status}</dd></div><div><dt>币种 / 状态</dt><dd>{fund.currency || "未知"} / {fund.product_status || "未知"}</dd></div><div><dt>跟踪误差</dt><dd>{fund.tracking_error == null ? "未知" : percent(fund.tracking_error)}</dd></div><div><dt>来源</dt><dd>{fund.source_name || "待刷新"}</dd></div></dl>{fund.valuation_lag_note && <p className="notice">{fund.valuation_lag_note}</p>}</Card>
+    </div>
+    <Card className="performance-metrics"><div className="section-heading"><div><span className="eyebrow">DETERMINISTIC METRICS</span><h2>收益与风险指标</h2></div><span>{metrics ? `${metrics.observations} 个净值观察值` : "不可计算"}</span></div>{metrics ? <div className="metric-grid"><article><span>近 1 月收益</span><strong className={metricTone(metrics.return_1m)}>{percent(metrics.return_1m)}</strong><small>约 21 个净值交易日</small></article><article><span>近 3 月收益</span><strong className={metricTone(metrics.return_3m)}>{percent(metrics.return_3m)}</strong><small>约 63 个净值交易日</small></article><article><span>近 1 年收益</span><strong className={metricTone(metrics.return_1y)}>{percent(metrics.return_1y)}</strong><small>约 252 个净值交易日</small></article><article><span>年化波动率</span><strong>{percent(metrics.volatility)}</strong><small>越高表示净值波动越大</small></article><article><span>最大回撤</span><strong className={metricTone(metrics.max_drawdown, true)}>{percent(metrics.max_drawdown)}</strong><small>窗口内高点至低点最大跌幅</small></article><article><span>简化夏普</span><strong>{ratioText(metrics.sharpe)}</strong><small>年化收益 ÷ 年化波动，无风险利率按 0</small></article><article><span>卡玛比率</span><strong>{ratioText(metrics.calmar)}</strong><small>年化收益 ÷ 最大回撤绝对值</small></article><article><span>窗口年化收益</span><strong className={metricTone(metrics.annualized_return)}>{percent(metrics.annualized_return)}</strong><small>仅用于统一窗口比较，不代表未来收益</small></article></div> : <p className="empty">累计净值不足，不能可靠计算收益、波动、回撤和风险调整指标。</p>}<p className="storage-note">这些是基金公开累计净值的确定性计算，不使用支付宝个人盈亏，也不由 AI 生成。</p></Card>
+    <Card><div className="section-heading"><div><span className="eyebrow">EVENT EVIDENCE</span><h2>公告与事件</h2></div><span>{detail.evidence.length} 条</span></div>{detail.evidence.length ? <div className="evidence-table">{detail.evidence.map((item) => <article key={item.id}><div><strong>{item.title}</strong><span>{item.published_at} · 来源 {item.source_level} · {item.verified ? "已核验" : "待核验"}</span></div><StatusPill value={item.severity} /><a href={item.source_url} target="_blank" rel="noreferrer">查看来源</a></article>)}</div> : <p className="empty">暂无已保存事件。自动公告将在评估时刷新，也可在“历史与数据”手工补充。</p>}</Card>
+  </>;
+}
+
+function AlternativesPage() {
+  const params = useParams();
+  const navigate = useNavigate();
+  const [input, setInput] = useState(params.code ?? "");
+  const code = params.code && /^\d{6}$/.test(params.code) ? params.code : "";
+  const client = useQueryClient();
+  const discovery = useQuery({
+    queryKey: ["discovery", "latest"],
+    queryFn: () => api.get<DiscoveryRun | null>("/discoveries/latest"),
+    refetchInterval: (query) => { const data = query.state.data as DiscoveryRun | null; return data && ["queued", "running"].includes(data.status) ? 1200 : false; },
+  });
+  const startDiscovery = useMutation({
+    mutationFn: () => api.post<{ run_id: number }>("/discoveries"),
+    onSuccess: () => client.invalidateQueries({ queryKey: ["discovery"] }),
+  });
+  const query = useQuery({ queryKey: ["alternatives", code], queryFn: () => api.get<Array<{ fund: Record<string, unknown>; tier: string; eligible: boolean; review_ready: boolean; persistence_count: number; improvements: string[]; counterpoints: string[]; metrics: Record<string, number | null> }>>(`/funds/${code}/alternatives`), enabled: Boolean(code), retry: false });
+  return <>
+    <PageHeader eyebrow="FUND DISCOVERY" title="基金探索与替代对照" description="主动寻找当前组合的同类候选，只展示多维改善和风险，不使用单一总分，也不生成直接买入指令。" action={<button className="button primary large" disabled={startDiscovery.isPending || ["queued", "running"].includes(discovery.data?.status ?? "")} onClick={() => startDiscovery.mutate()}>{startDiscovery.isPending || ["queued", "running"].includes(discovery.data?.status ?? "") ? "正在探索…" : "开始探索基金"}</button>} />
+    {(discovery.error || startDiscovery.error) && <div className="notice error">{((discovery.error || startDiscovery.error) as Error).message}</div>}
+    {discovery.data && ["queued", "running"].includes(discovery.data.status) && <Card className="progress-card"><div><strong>正在刷新持仓同类候选</strong><span>{discovery.data.progress}%</span></div><div className="progress"><i style={{ width: `${discovery.data.progress}%` }} /></div><p>按当前持仓的 peer 分类有限扫描，不遍历全市场全部基金。</p></Card>}
+    {discovery.data && !["queued", "running"].includes(discovery.data.status) && <Card className="discovery-results"><div className="section-heading"><div><span className="eyebrow">DISCOVERY RESULT</span><h2>本次探索候选</h2></div><span>#{discovery.data.id} · {discovery.data.results.length} 只</span></div>{discovery.data.error && <div className="notice warning">部分同类刷新失败：{discovery.data.error}</div>}{discovery.data.results.length ? <div className="discovery-grid">{discovery.data.results.map((item) => <article key={item.fund.code} className={item.eligible ? "eligible" : ""}><div className="alternative-title"><div><span>{item.fund.code} · {bucketLabels[item.bucket]}</span><strong>{item.fund.name}</strong></div><span className={`pill ${item.eligible ? "good" : "warn"}`}>{item.suggestion}</span></div><p>相对当前持有：{item.compared_to.name}（{item.compared_to.code}）</p><h3>筛选通过项</h3><ul>{item.improvements.map((value) => <li key={value}>{value}</li>)}</ul><h3>风险与未知</h3><ul>{item.counterpoints.length ? item.counterpoints.map((value) => <li key={value}>{value}</li>) : <li>当前规则未发现关键恶化，仍需查看基金详情和公告。</li>}</ul><div className="alternative-meta"><span>{item.tier === "strong" ? "基础候选层" : item.tier === "watch" ? "观察候选层" : "资料待补层"}</span><span>数据截至 {dateText(item.fund.value_date)}</span><span>最大回撤 {percent(item.metrics.max_drawdown)}</span></div><div className="candidate-actions"><NavLink to={`/funds/${item.fund.code}`}>查看详情</NavLink><NavLink to={`/alternatives/${item.compared_to.code}`}>查看完整对照</NavLink></div></article>)}</div> : <p className="empty">本次没有发现同时满足至少两项显著改善的数据候选。不会用演示数据或降低门槛补位。</p>}</Card>}
+    <Card className="single-comparison"><div className="section-heading"><div><span className="eyebrow">SINGLE FUND COMPARISON</span><h2>指定基金替代对照</h2></div></div><form className="code-search" onSubmit={(event) => { event.preventDefault(); if (/^\d{6}$/.test(input)) navigate(`/alternatives/${input}`); }}><input aria-label="当前持仓基金代码" value={input} onChange={(event) => setInput(event.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="当前持仓代码" /><button className="button secondary">生成对照</button></form></Card>
+    {!code && <Card className="empty-state"><h2>输入当前持仓基金代码</h2><p>系统只在已缓存的同仓同类基金中比较；不足两项显著改善不会标记为替代候选。</p></Card>}
+    {code && query.isLoading && <Card className="progress-card"><strong>正在刷新月度候选宇宙与最新净值…</strong></Card>}
+    {query.isError && <div className="notice error">{(query.error as Error).message}</div>}
+    {code && query.data && <Card><div className="section-heading"><div><span className="eyebrow">COMPARISON</span><h2>{code} 的多维对照</h2></div><span>最多 3 只</span></div>{query.data.length ? <div className="alternative-grid">{query.data.map((item) => <article key={String(item.fund.code)} className={item.review_ready ? "eligible" : ""}><div className="alternative-title"><div><span>{String(item.fund.code)}</span><strong>{String(item.fund.name)}</strong></div><StatusPill value={item.review_ready ? "ready" : "limited"} /></div><h3>明确改善</h3><ul>{item.improvements.length ? item.improvements.map((value) => <li key={value}>{value}</li>) : <li>未达到两项显著改善</li>}</ul><h3>反方与限制</h3><ul>{item.counterpoints.length ? item.counterpoints.map((value) => <li key={value}>{value}</li>) : <li>当前规则未发现关键恶化</li>}</ul><div className="alternative-meta"><span>{item.tier === "strong" ? "基础候选层" : item.tier === "watch" ? "观察候选层" : "资料待补层"}</span><span>{item.review_ready ? "已升级为替换复核" : item.eligible ? `有效对照 ${item.persistence_count}/2` : "尚未满足替代条件"}</span><span>最大回撤 {percent(item.metrics.max_drawdown)}</span></div></article>)}</div> : <p className="empty">当前月度候选宇宙中没有满足同类与数据门的候选。数据不足时不会以演示数据补位。</p>}</Card>}
+  </>;
+}
+
+function ReviewRow({ item, compact = false }: { item: ReviewItem; compact?: boolean }) {
+  const client = useQueryClient();
+  const [note, setNote] = useState("");
+  const decision = useMutation({ mutationFn: (choice: string) => api.post(`/review-items/${item.id}/decision`, { user_choice: choice, note }), onSuccess: () => client.invalidateQueries({ queryKey: ["reviews"] }) });
+  return <article className={`review-item ${compact ? "compact" : ""}`}><div className="review-main"><div className="review-tags"><span className="pill neutral">{reasonLabels[item.reason_type] ?? item.reason_type}</span><span className="pill neutral">{actionLabels[item.proposed_action] ?? item.proposed_action}</span><StatusPill value={item.severity} /></div><strong>{item.title}</strong><p>{item.detail}</p>{item.fund_code && <NavLink to={`/funds/${item.fund_code}`}>查看 {item.fund_code} 详情</NavLink>}</div>{!compact && <div className="decision-box">{item.decision ? <p>已选择：{item.decision.choice} · {item.decision.note || "无备注"}</p> : <><input value={note} onChange={(event) => setNote(event.target.value)} placeholder="可选备注" aria-label="复核决定备注" /><div><button disabled={decision.isPending} onClick={() => decision.mutate("agree")}>同意</button><button disabled={decision.isPending} onClick={() => decision.mutate("reject")}>拒绝</button><button disabled={decision.isPending} onClick={() => decision.mutate("defer")}>稍后</button></div></>}</div>}</article>;
+}
+
+function HistoryPage() {
+  const client = useQueryClient();
+  const reviews = useQuery({ queryKey: ["reviews"], queryFn: () => api.get<Review[]>("/reviews") });
+  const health = useQuery({ queryKey: ["data-health"], queryFn: () => api.get<DataHealth>("/data-health") });
+  const aiSettings = useQuery({ queryKey: ["ai-settings"], queryFn: () => api.get<AiConfiguration>("/settings/ai") });
+  const aiTest = useMutation({ mutationFn: () => api.post<{ ok: boolean; status: string; message: string; model?: string }>("/settings/ai/test") });
+  const [showAiSettings, setShowAiSettings] = useState(false);
+  const [aiForm, setAiForm] = useState<AiSettingsUpdate>({ enabled: false, api_key: "", base_url: "https://api.deepseek.com", model: "deepseek-v4-flash" });
+  const [evidence, setEvidence] = useState({ fund_code: "", title: "", source_url: "", published_at: new Date().toISOString().slice(0, 10), source_level: "B", content: "", event_type: "other", verified: false });
+  const addEvidence = useMutation({ mutationFn: () => api.post("/evidence/manual", { ...evidence, fund_code: evidence.fund_code || null, evidence_kind: "manual" }), onSuccess: () => setEvidence((value) => ({ ...value, title: "", source_url: "", content: "" })) });
+  const saveAiSettings = useMutation({
+    mutationFn: (payload: AiSettingsUpdate) => api.put<AiSettingsResponse>("/settings/ai", payload),
+    onSuccess: (result) => {
+      setAiForm((value) => ({ ...value, api_key: "" }));
+      client.setQueryData<AiConfiguration>(["ai-settings"], result);
+      client.invalidateQueries({ queryKey: ["data-health"] });
+    },
+  });
+  const aiConfig = aiSettings.data?.status ? aiSettings.data : health.data?.ai_config;
+  const aiLabel = aiConfig?.status === "configured" ? "已配置" : aiConfig?.status === "incomplete" ? "配置不完整" : "开关已关闭";
   useEffect(() => {
-    load().catch((error) => setNotice({ kind: "error", text: (error as Error).message }));
-  }, []);
+    if (!aiSettings.data) return;
+    setAiForm((value) => ({
+      ...value,
+      enabled: aiSettings.data.enabled,
+      base_url: aiSettings.data.base_url,
+      model: aiSettings.data.model ?? "deepseek-v4-flash",
+      api_key: "",
+    }));
+  }, [aiSettings.data]);
 
-  const upload = async (event: FormEvent) => {
+  function submitAiSettings(event: FormEvent) {
     event.preventDefault();
-    if (!file) return;
-    setBusy("upload");
-    setNotice(null);
-    try {
-      const batch = await api.upload<ImportBatch>("/imports", file);
-      await load(batch.id);
-      setFile(null);
-      setNotice({ kind: "ok", text: "图片已识别为草稿。请逐字段核对后确认导入。" });
-    } catch (error) {
-      setNotice({ kind: "error", text: (error as Error).message });
-    } finally {
-      setBusy("");
-    }
-  };
+    const apiKey = aiForm.api_key?.trim();
+    saveAiSettings.mutate({ ...aiForm, api_key: apiKey || undefined, clear_api_key: false });
+  }
 
-  const confirm = async () => {
-    if (!selected) return;
-    setBusy("confirm");
-    setNotice(null);
-    try {
-      await api.post(`/imports/${selected.id}/confirm`);
-      await load(selected.id);
-      setNotice({ kind: "ok", text: "已确认记录已经写入正式数据。" });
-    } catch (error) {
-      setNotice({ kind: "error", text: (error as Error).message });
-    } finally {
-      setBusy("");
-    }
-  };
+  function clearAiKey() {
+    if (!window.confirm("确定清除本机已保存的 DeepSeek API Key？清除后 AI 解释将不可用。")) return;
+    saveAiSettings.mutate({ ...aiForm, api_key: undefined, clear_api_key: true });
+  }
 
-  const remove = async () => {
-    if (!selected || !window.confirm(`删除导入批次 #${selected.id} 及其原图吗？`)) return;
-    setBusy("delete");
-    try {
-      await api.delete(`/imports/${selected.id}`);
-      setSelectedId(null);
-      await load();
-    } catch (error) {
-      setNotice({ kind: "error", text: (error as Error).message });
-    } finally {
-      setBusy("");
-    }
-  };
-
-  return (
-    <>
-      <PageHeader
-        eyebrow="OCR REVIEW"
-        title="截图导入中心"
-        description="候选、持仓和交易图片先在本机 OCR，再由你确认。DeepSeek 不接收原图。"
-      />
-      <Notice value={notice} />
+  return <>
+    <PageHeader eyebrow="AUDIT TRAIL" title="历史与数据" description="查看每次评估、用户决定、数据健康和可选 AI。这里的记录不会执行或模拟交易。" action={<button className="button secondary" onClick={() => api.download("/exports/full", `fundlab-v2-${new Date().toISOString().slice(0, 10)}.json`)}>导出完整数据</button>} />
+    {(reviews.isLoading || health.isLoading || aiSettings.isLoading) && <Card className="progress-card"><strong>正在读取运行留痕与数据健康…</strong></Card>}
+    {(reviews.error || health.error || aiSettings.error) && <div className="notice error">{((reviews.error || health.error || aiSettings.error) as Error).message}</div>}
+    <div className="health-grid">
+      <Card><span className="eyebrow">MARKET DATA</span><h2>公开数据</h2><strong>{health.data?.provider ?? "检查中"}</strong><p>{health.data?.fund_count ?? 0} 只基金 · 最近获取 {dateText(health.data?.latest_fetch)}</p></Card>
+      <Card><span className="eyebrow">LOCAL OCR</span><h2>本地识别</h2><strong>{health.data?.ocr === "ready" ? "RapidOCR 就绪" : "手工录入可用"}</strong><p>原图和草稿不会发送给 DeepSeek。</p></Card>
       <Card>
-        <form className="upload-zone" onSubmit={upload}>
-          <label>
-            <strong>选择支付宝截图</strong>
-            <span>支持 JPG、PNG、WebP，单张不超过 12 MB</span>
-            <input
-              accept="image/jpeg,image/png,image/webp"
-              onChange={(event) => setFile(event.target.files?.[0] ?? null)}
-              type="file"
-              required
-            />
-          </label>
-          <button className="button primary" disabled={!file || busy === "upload"} type="submit">
-            {busy === "upload" ? "识别中…" : "上传并识别"}
-          </button>
-        </form>
+        <span className="eyebrow">DEEPSEEK</span><h2>可选解释</h2><strong>{aiLabel}</strong>
+        {aiConfig && <div className="ai-config"><span>开关：{aiConfig.enabled ? "已开启" : "已关闭"}</span><span>API Key：{aiConfig.key_configured ? "已保存" : "未保存"}</span><span>模型：{aiConfig.model ?? "未填写"}</span>{aiConfig.missing.length > 0 && <span className="config-missing">缺少：{aiConfig.missing.join("、")}</span>}</div>}
+        <div className="ai-actions"><button className="button primary" aria-expanded={showAiSettings} onClick={() => setShowAiSettings((value) => !value)}>{showAiSettings ? "收起配置" : "配置 AI"}</button><button className="button secondary" onClick={() => aiTest.mutate()} disabled={aiTest.isPending || aiConfig?.status !== "configured"}>{aiTest.isPending ? "正在测试…" : "测试连接"}</button></div>
+        {aiTest.data && <div className={`notice ${aiTest.data.ok ? "" : "error"}`}>{aiTest.data.message}</div>}{aiTest.error && <div className="notice error">{(aiTest.error as Error).message}</div>}
       </Card>
-      <div className="import-layout">
-        <Card>
-          <div className="card-heading"><h2>导入批次</h2></div>
-          <div className="batch-list">
-            {batches.length === 0 && <p className="empty">尚未上传截图。</p>}
-            {batches.map((batch) => (
-              <button
-                className={selectedId === batch.id ? "batch active" : "batch"}
-                key={batch.id}
-                onClick={() => setSelectedId(batch.id)}
-                type="button"
-              >
-                <strong>#{batch.id} {batch.filename}</strong>
-                <span>{batch.page_type} · {batch.status} · {batch.items.length} 条</span>
-              </button>
-            ))}
-          </div>
-        </Card>
-        <Card>
-          {!selected ? (
-            <p className="empty">选择一个批次开始校对。</p>
-          ) : (
-            <>
-              <div className="card-heading">
-                <div><span className="eyebrow">BATCH #{selected.id}</span><h2>逐字段校对</h2></div>
-                <span className="tag">{selected.status}</span>
-              </div>
-              {selected.error && <div className="notice error">{selected.error}</div>}
-              {selected.items.map((item) => (
-                <ImportEditor item={item} key={item.id} onSaved={() => load(selected.id)} />
-              ))}
-              <details>
-                <summary>查看 OCR 原文</summary>
-                <pre className="ocr-text">{selected.raw_text || "没有 OCR 文本"}</pre>
-              </details>
-              <div className="action-row">
-                <button
-                  className="button primary"
-                  disabled={busy !== "" || selected.status === "confirmed"}
-                  onClick={confirm}
-                  type="button"
-                >
-                  {busy === "confirm" ? "确认中…" : "确认并写入正式数据"}
-                </button>
-                <button className="button danger" disabled={busy !== ""} onClick={remove} type="button">
-                  删除批次和原图
-                </button>
-              </div>
-            </>
-          )}
-        </Card>
-      </div>
-    </>
-  );
+    </div>
+    {showAiSettings && <Card className="ai-settings-card">
+      <div className="section-heading"><div><span className="eyebrow">LOCAL AI SETTINGS</span><h2>DeepSeek 配置</h2></div><StatusPill value={aiConfig?.status ?? "disabled"} /></div>
+      <p className="settings-intro">配置只写入这台电脑上的项目 <code>.env</code>，保存后立即生效。已保存的 Key 永远不会回显；留空表示保留原 Key。</p>
+      {aiConfig && aiConfig.environment_overrides.length > 0 && <div className="notice warning">以下值由启动环境覆盖，需先从启动脚本或系统环境中移除：{aiConfig.environment_overrides.join("、")}</div>}
+      <form className="ai-settings-form" onSubmit={submitAiSettings}>
+        <label className="check ai-enabled"><input type="checkbox" checked={aiForm.enabled} onChange={(event) => setAiForm({ ...aiForm, enabled: event.target.checked })} />启用 DeepSeek 解释</label>
+        <label>API Key<input type="password" autoComplete="new-password" value={aiForm.api_key ?? ""} onChange={(event) => setAiForm({ ...aiForm, api_key: event.target.value })} placeholder={aiConfig?.key_configured ? "已保存；留空则不修改" : "请输入 DeepSeek API Key"} aria-describedby="ai-key-help" /></label>
+        <small id="ai-key-help">Key 不进入数据库、日志或导出文件；它只由本机后端写入被 Git 忽略的 .env。</small>
+        <div className="form-pair"><label>模型<select value={aiForm.model} onChange={(event) => setAiForm({ ...aiForm, model: event.target.value })}><option value="deepseek-v4-flash">deepseek-v4-flash</option><option value="deepseek-v4-pro">deepseek-v4-pro</option></select></label><label>Base URL<input type="url" required value={aiForm.base_url} onChange={(event) => setAiForm({ ...aiForm, base_url: event.target.value })} /></label></div>
+        <div className="ai-form-actions"><button className="button primary" disabled={saveAiSettings.isPending}>{saveAiSettings.isPending ? "正在保存…" : "保存并立即生效"}</button>{aiConfig?.key_configured && <button type="button" className="button danger-outline" disabled={saveAiSettings.isPending} onClick={clearAiKey}>清除已保存 Key</button>}</div>
+        {saveAiSettings.data && <div className="notice">{saveAiSettings.data.message}</div>}{saveAiSettings.error && <div className="notice error">{(saveAiSettings.error as Error).message}</div>}
+      </form>
+    </Card>}
+    <div className="history-grid"><Card><div className="section-heading"><div><span className="eyebrow">REVIEW HISTORY</span><h2>评估历史</h2></div><span>{reviews.data?.length ?? 0} 次</span></div><div className="run-list">{reviews.data?.map((run) => <details key={run.id}><summary><span>#{run.id} · {run.as_of_date}</span><strong>{run.verdict_label}</strong><StatusPill value={run.status} /></summary><div className="run-body"><div className="run-meta"><StatusPill value={run.data_quality} /><span>规则 {run.rule_version}</span><span>{run.items.length} 项复核</span></div>{run.items.map((item) => <ReviewRow key={item.id} item={item} />)}<AiExplanationPanel runId={run.id} /></div></details>) ?? <p className="empty">暂无评估历史</p>}</div></Card>
+      <Card><span className="eyebrow">MANUAL EVIDENCE</span><h2>补充公告或新闻</h2><form className="evidence-form" onSubmit={(event: FormEvent) => { event.preventDefault(); addEvidence.mutate(); }}><label>基金代码（可空）<input value={evidence.fund_code} onChange={(event) => setEvidence({ ...evidence, fund_code: event.target.value.replace(/\D/g, "").slice(0, 6) })} /></label><label>标题<input required value={evidence.title} onChange={(event) => setEvidence({ ...evidence, title: event.target.value })} /></label><label>来源链接<input required type="url" value={evidence.source_url} onChange={(event) => setEvidence({ ...evidence, source_url: event.target.value })} /></label><div className="form-pair"><label>发布日期<input type="date" value={evidence.published_at} onChange={(event) => setEvidence({ ...evidence, published_at: event.target.value })} /></label><label>来源等级<select value={evidence.source_level} onChange={(event) => setEvidence({ ...evidence, source_level: event.target.value })}><option>S</option><option>A</option><option>B</option><option>C</option></select></label></div><label>摘要<textarea value={evidence.content} onChange={(event) => setEvidence({ ...evidence, content: event.target.value })} /></label><label className="check"><input type="checkbox" checked={evidence.verified} onChange={(event) => setEvidence({ ...evidence, verified: event.target.checked })} />我已核对原始来源</label><button className="button primary" disabled={addEvidence.isPending}>保存证据</button>{addEvidence.isSuccess && <p className="success-text">证据已保存</p>}{addEvidence.error && <div className="notice error">{(addEvidence.error as Error).message}</div>}</form></Card></div>
+  </>;
 }
 
-function ImportEditor({ item, onSaved }: { item: ImportItem; onSaved: () => Promise<void> }) {
-  const [draft, setDraft] = useState(item);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  useEffect(() => setDraft(item), [item]);
-
-  const save = async (event: FormEvent) => {
-    event.preventDefault();
-    setBusy(true);
-    setError("");
-    try {
-      await api.put(`/import-items/${item.id}`, {
-        kind: draft.kind,
-        fund_code: draft.fund_code,
-        fund_name: draft.fund_name,
-        action: draft.action,
-        amount: draft.amount,
-        shares: draft.shares,
-        event_time: draft.event_time,
-      });
-      await onSaved();
-    } catch (reason) {
-      setError((reason as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-    <form className="draft-card" onSubmit={save}>
-      <div className="draft-meta">
-        <span className="tag">{draft.kind}</span>
-        <span>识别置信度 {percent(draft.confidence)}</span>
-        {draft.confirmed && <span className="tag success">已确认</span>}
-      </div>
-      {draft.issues && <p className="field-warning">{draft.issues}</p>}
-      {error && <p className="field-error">{error}</p>}
-      <div className="form-grid">
-        <label>记录类型
-          <select value={draft.kind} onChange={(e) => setDraft({ ...draft, kind: e.target.value as ImportItem["kind"] })} disabled={draft.confirmed}>
-            <option value="candidate">候选</option><option value="holding">持仓</option><option value="transaction">交易</option>
-          </select>
-        </label>
-        <label>基金代码
-          <input value={draft.fund_code} onChange={(e) => setDraft({ ...draft, fund_code: e.target.value.replace(/\D/g, "").slice(0, 6) })} disabled={draft.confirmed} required />
-        </label>
-        <label className="span-two">基金名称
-          <input value={draft.fund_name} onChange={(e) => setDraft({ ...draft, fund_name: e.target.value })} disabled={draft.confirmed} required />
-        </label>
-        {draft.kind === "transaction" && <label>动作
-          <select value={draft.action || "buy"} onChange={(e) => setDraft({ ...draft, action: e.target.value })} disabled={draft.confirmed}>
-            <option value="buy">买入</option><option value="sell">卖出</option><option value="convert_out">转换转出</option><option value="convert_in">转换转入</option>
-          </select>
-        </label>}
-        {draft.kind !== "candidate" && <label>金额（元）
-          <input type="number" min="0" step="0.01" value={draft.amount ?? ""} onChange={(e) => setDraft({ ...draft, amount: e.target.value ? Number(e.target.value) : null })} disabled={draft.confirmed} />
-        </label>}
-        {draft.kind === "transaction" && <label>份额
-          <input type="number" min="0" step="0.0001" value={draft.shares ?? ""} onChange={(e) => setDraft({ ...draft, shares: e.target.value ? Number(e.target.value) : null })} disabled={draft.confirmed} />
-        </label>}
-        {draft.kind !== "candidate" && <label>时间
-          <input type="datetime-local" value={draft.event_time?.slice(0, 16) ?? ""} onChange={(e) => setDraft({ ...draft, event_time: e.target.value ? new Date(e.target.value).toISOString() : null })} disabled={draft.confirmed} />
-        </label>}
-      </div>
-      {!draft.confirmed && <button className="button secondary" disabled={busy} type="submit">{busy ? "保存中…" : "保存校对"}</button>}
-    </form>
-  );
-}
-
-function Portfolio() {
-  const [holdings, setHoldings] = useState<Holding[]>([]);
-  const [transactions, setTransactions] = useState<Transaction[]>([]);
-  const [mode, setMode] = useState<"holding" | "transaction">("holding");
-  const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
-  const [holdingForm, setHoldingForm] = useState({
-    fund_code: "", fund_name: "", amount: "", snapshot_date: new Date().toISOString().slice(0, 10),
-  });
-  const [transactionForm, setTransactionForm] = useState({
-    fund_code: "", fund_name: "", action: "buy", amount: "", trade_time: new Date().toISOString().slice(0, 16),
-  });
-
-  const load = async () => {
-    const [holdingData, transactionData] = await Promise.all([
-      api.get<Holding[]>("/holdings"),
-      api.get<Transaction[]>("/transactions"),
-    ]);
-    setHoldings(holdingData);
-    setTransactions(transactionData);
-  };
-  useEffect(() => { load().catch((e) => setNotice({ kind: "error", text: (e as Error).message })); }, []);
-  const latestDate = holdings[0]?.snapshot_date;
-  const latest = holdings.filter((item) => item.snapshot_date === latestDate);
-  const total = latest.reduce((sum, item) => sum + item.amount, 0);
-
-  const addHolding = async (event: FormEvent) => {
-    event.preventDefault(); setBusy(true); setNotice(null);
-    try {
-      await api.post("/holdings", { ...holdingForm, amount: Number(holdingForm.amount) });
-      setHoldingForm({ fund_code: "", fund_name: "", amount: "", snapshot_date: new Date().toISOString().slice(0, 10) });
-      await load(); setNotice({ kind: "ok", text: "持仓快照已保存。" });
-    } catch (e) { setNotice({ kind: "error", text: (e as Error).message }); } finally { setBusy(false); }
-  };
-  const addTransaction = async (event: FormEvent) => {
-    event.preventDefault(); setBusy(true); setNotice(null);
-    try {
-      await api.post("/transactions", {
-        ...transactionForm,
-        amount: Number(transactionForm.amount),
-        trade_time: new Date(transactionForm.trade_time).toISOString(),
-      });
-      setTransactionForm({ fund_code: "", fund_name: "", action: "buy", amount: "", trade_time: new Date().toISOString().slice(0, 16) });
-      await load(); setNotice({ kind: "ok", text: "交易已保存并完成重复检查。" });
-    } catch (e) { setNotice({ kind: "error", text: (e as Error).message }); } finally { setBusy(false); }
-  };
-  const remove = async (kind: "holdings" | "transactions", id: number) => {
-    if (!window.confirm("确认删除这条记录吗？")) return;
-    try { await api.delete(`/${kind}/${id}`); await load(); } catch (e) { setNotice({ kind: "error", text: (e as Error).message }); }
-  };
-
-  return (
-    <>
-      <PageHeader eyebrow="PORTFOLIO LEDGER" title="持仓与交易" description="持仓截图是快照；精确成本和现金流需要确认后的完整交易记录。" />
-      <Notice value={notice} />
-      <div className="metric-grid compact">
-        <Card><span className="metric-label">最新快照总额</span><strong className="metric-value">{money(total)}</strong><small>{latestDate ?? "尚无快照"}</small></Card>
-        <Card><span className="metric-label">持仓项目</span><strong className="metric-value">{latest.length}</strong><small>按最新日期</small></Card>
-        <Card><span className="metric-label">交易记录</span><strong className="metric-value">{transactions.length}</strong><small>已去重写入</small></Card>
-      </div>
-      <div className="tab-row">
-        <button className={mode === "holding" ? "tab active" : "tab"} onClick={() => setMode("holding")} type="button">录入持仓</button>
-        <button className={mode === "transaction" ? "tab active" : "tab"} onClick={() => setMode("transaction")} type="button">录入交易</button>
-      </div>
-      <div className="two-column">
-        <Card>
-          {mode === "holding" ? (
-            <form className="form-grid" onSubmit={addHolding}>
-              <label>基金代码<input pattern="\d{6}" value={holdingForm.fund_code} onChange={(e) => setHoldingForm({ ...holdingForm, fund_code: e.target.value.replace(/\D/g, "").slice(0, 6) })} required /></label>
-              <label>快照日期<input type="date" value={holdingForm.snapshot_date} onChange={(e) => setHoldingForm({ ...holdingForm, snapshot_date: e.target.value })} required /></label>
-              <label className="span-two">基金名称<input value={holdingForm.fund_name} onChange={(e) => setHoldingForm({ ...holdingForm, fund_name: e.target.value })} required /></label>
-              <label>持仓金额<input min="0" step="0.01" type="number" value={holdingForm.amount} onChange={(e) => setHoldingForm({ ...holdingForm, amount: e.target.value })} required /></label>
-              <button className="button primary align-end" disabled={busy} type="submit">{busy ? "保存中…" : "保存持仓快照"}</button>
-            </form>
-          ) : (
-            <form className="form-grid" onSubmit={addTransaction}>
-              <label>基金代码<input pattern="\d{6}" value={transactionForm.fund_code} onChange={(e) => setTransactionForm({ ...transactionForm, fund_code: e.target.value.replace(/\D/g, "").slice(0, 6) })} required /></label>
-              <label>交易动作<select value={transactionForm.action} onChange={(e) => setTransactionForm({ ...transactionForm, action: e.target.value })}><option value="buy">买入</option><option value="sell">卖出</option><option value="convert_in">转换转入</option><option value="convert_out">转换转出</option><option value="dividend">分红</option></select></label>
-              <label className="span-two">基金名称<input value={transactionForm.fund_name} onChange={(e) => setTransactionForm({ ...transactionForm, fund_name: e.target.value })} required /></label>
-              <label>金额<input min="0" step="0.01" type="number" value={transactionForm.amount} onChange={(e) => setTransactionForm({ ...transactionForm, amount: e.target.value })} required /></label>
-              <label>交易时间<input type="datetime-local" value={transactionForm.trade_time} onChange={(e) => setTransactionForm({ ...transactionForm, trade_time: e.target.value })} required /></label>
-              <button className="button primary align-end" disabled={busy} type="submit">{busy ? "保存中…" : "保存交易"}</button>
-            </form>
-          )}
-        </Card>
-        <Card>
-          <div className="card-heading"><h2>{mode === "holding" ? "持仓快照记录" : "交易流水"}</h2></div>
-          <div className="record-list">
-            {mode === "holding" && holdings.map((item) => (
-              <div className="record" key={item.id}><div><strong>{item.fund_name}</strong><span>{item.fund_code} · {item.snapshot_date} · {item.source}</span></div><b>{money(item.amount)}</b><button aria-label={`删除持仓 ${item.fund_name}`} onClick={() => remove("holdings", item.id)} type="button">×</button></div>
-            ))}
-            {mode === "transaction" && transactions.map((item) => (
-              <div className="record" key={item.id}><div><strong>{item.fund_name}</strong><span>{item.fund_code} · {item.action} · {new Date(item.trade_time).toLocaleString()}</span></div><b>{money(item.amount)}</b><button aria-label={`删除交易 ${item.fund_name}`} onClick={() => remove("transactions", item.id)} type="button">×</button></div>
-            ))}
-            {(mode === "holding" ? holdings : transactions).length === 0 && <p className="empty">暂无记录。</p>}
-          </div>
-        </Card>
-      </div>
-    </>
-  );
-}
-
-function Triggers() {
-  const [candidates, setCandidates] = useState<Candidate[]>([]);
-  const [items, setItems] = useState<Trigger[]>([]);
-  const [form, setForm] = useState({ candidate_id: "", metric: "latest_nav", operator: "<=", threshold: "" });
-  const [busy, setBusy] = useState("");
-  const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
-  const names = useMemo(() => Object.fromEntries(candidates.map((item) => [item.id, item.fund_name])), [candidates]);
-  const load = async () => {
-    const [funds, triggers] = await Promise.all([api.get<Candidate[]>("/candidates"), api.get<Trigger[]>("/triggers")]);
-    setCandidates(funds); setItems(triggers);
-    if (!form.candidate_id && funds[0]) setForm((current) => ({ ...current, candidate_id: String(funds[0].id) }));
-  };
-  useEffect(() => { load().catch((e) => setNotice({ kind: "error", text: (e as Error).message })); }, []);
-  const create = async (event: FormEvent) => {
-    event.preventDefault(); setBusy("create");
-    try {
-      await api.post("/triggers", { ...form, candidate_id: Number(form.candidate_id), threshold: Number(form.threshold) });
-      setForm({ ...form, threshold: "" }); await load();
-    } catch (e) { setNotice({ kind: "error", text: (e as Error).message }); } finally { setBusy(""); }
-  };
-  const check = async () => {
-    setBusy("check");
-    try { setItems(await api.post<Trigger[]>("/triggers/check")); setNotice({ kind: "ok", text: "已使用最新本地数据检查全部启用条件。" }); }
-    catch (e) { setNotice({ kind: "error", text: (e as Error).message }); } finally { setBusy(""); }
-  };
-  const remove = async (id: number) => {
-    if (!window.confirm("确认删除这个触发条件吗？")) return;
-    try { await api.delete(`/triggers/${id}`); await load(); } catch (e) { setNotice({ kind: "error", text: (e as Error).message }); }
-  };
-  return (
-    <>
-      <PageHeader eyebrow="CONDITION WATCH" title="条件触发器" description="本地版在你主动检查时运行。它提醒重新研究，不会自动申购或赎回。" action={<button className="button secondary" onClick={check} disabled={busy !== ""} type="button">{busy === "check" ? "检查中…" : "立即检查全部"}</button>} />
-      <Notice value={notice} />
-      <Card>
-        <form className="inline-form" onSubmit={create}>
-          <label>候选基金<select value={form.candidate_id} onChange={(e) => setForm({ ...form, candidate_id: e.target.value })} required><option value="">请选择</option>{candidates.map((item) => <option key={item.id} value={item.id}>{item.fund_code} {item.fund_name}</option>)}</select></label>
-          <label>指标<select value={form.metric} onChange={(e) => setForm({ ...form, metric: e.target.value })}><option value="latest_nav">最新单位净值</option><option value="drawdown">最大回撤</option><option value="annualized_return">年化收益</option><option value="volatility">年化波动</option></select></label>
-          <label>关系<select value={form.operator} onChange={(e) => setForm({ ...form, operator: e.target.value })}><option value="<=">≤</option><option value="<">&lt;</option><option value=">=">≥</option><option value=">">&gt;</option></select></label>
-          <label>阈值<input type="number" step="0.0001" value={form.threshold} onChange={(e) => setForm({ ...form, threshold: e.target.value })} required /></label>
-          <button className="button primary" disabled={busy !== "" || candidates.length === 0} type="submit">{busy === "create" ? "保存中…" : "保存条件"}</button>
-        </form>
-      </Card>
-      <div className="stack">
-        {items.map((item) => (
-          <Card key={item.id}>
-            <div className="trigger-row">
-              <div><span className="eyebrow">{item.metric}</span><h2>{names[item.candidate_id] ?? `候选 #${item.candidate_id}`}</h2><p>当数值 {item.operator} {item.threshold}</p></div>
-              <div className={item.last_matched ? "trigger-result matched" : "trigger-result"}><strong>{item.last_matched == null ? "未检查" : item.last_matched ? "已命中" : "未命中"}</strong><span>最近值 {item.last_value ?? "—"}</span></div>
-              <button className="button danger" onClick={() => remove(item.id)} type="button">删除</button>
-            </div>
-          </Card>
-        ))}
-        {items.length === 0 && <Card><p className="empty">尚未保存触发条件。</p></Card>}
-      </div>
-    </>
-  );
-}
-
-function Settings() {
-  const [settings, setSettings] = useState<Record<string, string | number | boolean> | null>(null);
-  const [busy, setBusy] = useState("");
-  const [notice, setNotice] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
-  const load = async () => {
-    setBusy("load");
-    try { setSettings(await api.get("/settings")); } catch (e) { setNotice({ kind: "error", text: (e as Error).message }); } finally { setBusy(""); }
-  };
-  useEffect(() => { void load(); }, []);
-  const testAI = async () => {
-    setBusy("ai"); setNotice(null);
-    try {
-      const result = await api.post<{ ok: boolean; message: string; model?: string }>("/settings/ai/test");
-      setNotice({ kind: result.ok ? "ok" : "error", text: `${result.message}${result.model ? `（${result.model}）` : ""}` });
-    } catch (e) { setNotice({ kind: "error", text: (e as Error).message }); } finally { setBusy(""); }
-  };
-  const exportData = async () => {
-    setBusy("export"); setNotice(null);
-    try {
-      await api.download("/exports/full", `fundlab-export-${new Date().toISOString().slice(0, 10)}.json`);
-      setNotice({ kind: "ok", text: "结构化数据导出已生成。" });
-    } catch (e) { setNotice({ kind: "error", text: (e as Error).message }); } finally { setBusy(""); }
-  };
-  return (
-    <>
-      <PageHeader eyebrow="LOCAL SETTINGS" title="运行设置" description="敏感配置只从本机环境变量读取，前端不会显示或保存 API Key。" action={<button className="button secondary" onClick={load} disabled={busy !== ""} type="button">{busy === "load" ? "刷新中…" : "刷新状态"}</button>} />
-      <Notice value={notice} />
-      <div className="two-column">
-        <Card><span className="eyebrow">RISK</span><h2>风险参数</h2><div className="setting-row"><span>阶段性回撤参考</span><strong>{percent(settings?.risk_tolerance as number)}</strong></div><p className="muted">这个值参与决策门控与压力提示，但不代表能够在该位置成交或止损。</p></Card>
-        <Card><span className="eyebrow">PROVIDERS</span><h2>本地能力</h2><div className="setting-row"><span>公开数据</span><strong>{String(settings?.market_provider ?? "—")}</strong></div><div className="setting-row"><span>截图识别</span><strong>{String(settings?.ocr ?? "—")}</strong></div><div className="setting-row"><span>原图保留</span><strong>{settings?.keep_uploads ? "是" : "否"}</strong></div></Card>
-        <Card><span className="eyebrow">AI</span><h2>DeepSeek</h2><div className="setting-row"><span>启用状态</span><strong>{settings?.ai_enabled ? "已启用" : "Mock / 未启用"}</strong></div><div className="setting-row"><span>模型</span><strong>{String(settings?.ai_model ?? "—")}</strong></div><button className="button primary" onClick={testAI} disabled={busy !== ""} type="button">{busy === "ai" ? "测试中…" : "测试 AI 连接"}</button><p className="muted">测试请求不包含图片、持仓或交易数据，也不会自动启用 AI。</p></Card>
-        <Card><span className="eyebrow">BOUNDARY</span><h2>数据边界</h2><ul><li>截图只在本机 OCR，并先进入草稿。</li><li>公开基金数据与个人事实分开保存。</li><li>DeepSeek 只能解释经过筛选的文字证据。</li><li>系统不登录支付宝，也不执行交易。</li></ul><button className="button secondary" onClick={exportData} disabled={busy !== ""} type="button">{busy === "export" ? "导出中…" : "导出结构化数据"}</button></Card>
-      </div>
-    </>
-  );
+function App() {
+  return <Shell><Routes><Route path="/" element={<Dashboard />} /><Route path="/portfolio" element={<PortfolioPage />} /><Route path="/funds" element={<FundPage />} /><Route path="/funds/:code" element={<FundPage />} /><Route path="/alternatives" element={<AlternativesPage />} /><Route path="/alternatives/:code" element={<AlternativesPage />} /><Route path="/history" element={<HistoryPage />} /><Route path="*" element={<Navigate to="/" replace />} /></Routes></Shell>;
 }
 
 export default App;

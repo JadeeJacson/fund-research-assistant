@@ -5,26 +5,32 @@ on:
   pull_request:
 
 jobs:
-  legacy-python:
-    name: 旧原型回归
-    runs-on: ubuntu-latest
+  windows-powershell:
+    name: Windows PowerShell 脚本兼容性
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-      - name: 安装旧原型
+      - name: PowerShell 5.1 语法检查
+        shell: powershell
         run: |
-          python -m pip install --upgrade pip
-          pip install -e ".[dev]"
-      - name: 代码检查
-        run: ruff check src tests app.py pages
-      - name: 单元测试
-        run: pytest --cov=fundlab --cov-report=term-missing
+          $failed = $false
+          Get-ChildItem scripts -Filter *.ps1 | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $_.FullName,
+              [ref]$tokens,
+              [ref]$errors
+            ) | Out-Null
+            if ($errors.Count -gt 0) {
+              $failed = $true
+              Write-Error "$($_.Name): $($errors -join '; ')"
+            }
+          }
+          if ($failed) { exit 1 }
 
-  mvp-backend:
-    name: MVP 后端
+  v2-backend:
+    name: v2.1 后端
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -45,11 +51,11 @@ jobs:
         working-directory: backend
         run: |
           pytest --cov=app --cov-report=term-missing
-          FUNDLAB_V1_DATABASE_URL=sqlite:////tmp/fundlab_migration.sqlite3 alembic upgrade head
-          FUNDLAB_V1_DATABASE_URL=sqlite:////tmp/fundlab_migration.sqlite3 alembic downgrade base
+          FUNDLAB_DATABASE_URL=sqlite:////tmp/fundlab_v2_migration.sqlite3 alembic upgrade head
+          FUNDLAB_DATABASE_URL=sqlite:////tmp/fundlab_v2_migration.sqlite3 alembic downgrade base
 
-  mvp-frontend:
-    name: MVP 前端
+  v2-frontend:
+    name: v2.1 前端
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -69,5 +75,6 @@ jobs:
       - name: 浏览器测试
         working-directory: frontend
         run: |
-          npx playwright install --with-deps chromium
+          npx playwright install-deps chromium
+          npm run e2e:install
           npm run e2e

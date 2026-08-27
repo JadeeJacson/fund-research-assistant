@@ -1,122 +1,103 @@
 import hashlib
-import io
 import json
+import os
+from contextlib import suppress
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session, selectinload
 
 try:
     from PIL import Image
-except ImportError:  # pragma: no cover - 正式依赖中包含 Pillow
+except ImportError:  # pragma: no cover
     Image = None
 
-from sqlalchemy import delete, func, select
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session, selectinload
-
-from .ai import explain_report, test_deepseek
-from .analytics import calculate_metrics
-from .config import Settings
+from .ai import (
+    AI_PROMPT_VERSION,
+    AI_SCHEMA_VERSION,
+    ai_configuration_status,
+    explain_review,
+    test_deepseek,
+)
+from .analytics import calculate_performance_chart, calculate_window_metrics
+from .config import Settings, update_local_env
 from .database import Database
-from .decision import DecisionContext, build_decision
+from .decision import bucket_allocation
 from .models import (
-    AnalysisReport,
-    Candidate,
+    AiRun,
+    BucketAssignment,
+    DiscoveryRun,
     Evidence,
-    Holding,
+    Fund,
+    HoldingItem,
+    HoldingSnapshot,
+    IdempotencyRecord,
     ImportBatch,
     ImportItem,
     NavPoint,
-    Transaction,
-    TriggerRule,
+    Portfolio,
+    ProviderSnapshot,
+    ReviewDecision,
+    ReviewItem,
+    ReviewRun,
 )
-from .ocr import OCRService, parse_ocr_text
-from .providers import KNOWN_FUNDS, ProviderChain
+from .ocr import OCRService, classify_page, parse_ocr_text
+from .providers import MarketProvider, build_provider, classify_event, match_fund_catalog
 from .schemas import (
-    CandidateCreate,
-    CandidateRead,
+    AiSettingsUpdate,
+    BucketAssignmentUpdate,
     EvidenceCreate,
-    EvidenceRead,
-    HoldingCreate,
-    HoldingRead,
-    ImportBatchRead,
-    ImportItemRead,
-    ImportItemUpdate,
-    ReportRequest,
-    TransactionCreate,
-    TransactionRead,
-    TriggerCreate,
-    TriggerRead,
+    FundEnsure,
+    FundRead,
+    ImportConfirm,
+    PortfolioUpdate,
+    ReviewDecisionCreate,
+    SnapshotCreate,
+)
+from .services import (
+    alternatives_for,
+    create_snapshot,
+    discovery_json,
+    ensure_fund,
+    ensure_portfolio,
+    fund_dict,
+    latest_snapshot,
+    prepare_peer_universe,
+    process_discovery,
+    process_review,
+    refresh_fund,
+    review_json,
+    run_fingerprint,
+    snapshot_json,
 )
 
 MAX_UPLOAD_BYTES = 12 * 1024 * 1024
 ALLOWED_IMAGE_TYPES = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
 
 
-def transaction_fingerprint(payload: TransactionCreate) -> str:
-    normalized = "|".join(
-        [
-            payload.fund_code,
-            payload.action,
-            payload.trade_time.isoformat(),
-            str(payload.amount),
-            str(payload.shares),
-            payload.source,
-        ]
-    )
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-
-
-def _operator_matches(value: float, operator: str, threshold: float) -> bool:
-    return {
-        "<": value < threshold,
-        "<=": value <= threshold,
-        ">": value > threshold,
-        ">=": value >= threshold,
-    }[operator]
-
-
-def create_app(
-    *,
-    database_url: str | None = None,
-    project_root: Path | None = None,
-) -> FastAPI:
+def create_app(*, database_url: str | None = None, project_root: Path | None = None, provider: MarketProvider | None = None) -> FastAPI:
     settings = Settings.from_env(project_root)
     if database_url is not None:
-        settings = Settings(
-            project_root=settings.project_root,
-            database_url=database_url,
-            upload_dir=settings.upload_dir,
-            risk_tolerance=settings.risk_tolerance,
-            ai_enabled=settings.ai_enabled,
-            deepseek_api_key=settings.deepseek_api_key,
-            deepseek_base_url=settings.deepseek_base_url,
-            deepseek_model=settings.deepseek_model,
-            market_provider=settings.market_provider,
-            keep_uploads=settings.keep_uploads,
-        )
+        settings = replace(settings, database_url=database_url)
     database = Database(settings.database_url)
     database.create_all()
-    provider = ProviderChain(settings.market_provider)
-    ocr_service = OCRService()
+    market_provider = provider or build_provider(settings.market_provider)
+    ocr = OCRService()
 
-    app = FastAPI(
-        title="个人基金研究助手 API",
-        version="1.0.0-mvp",
-        docs_url="/api/docs",
-        openapi_url="/api/openapi.json",
-    )
+    app = FastAPI(title="基金仓位决策台 API", version="2.1.0", docs_url="/api/docs", openapi_url="/api/openapi.json")
     app.state.settings = settings
     app.state.database = database
-    app.state.provider = provider
-    app.state.ocr = ocr_service
+    app.state.provider = market_provider
+    app.state.ocr = ocr
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://127.0.0.1:5173", "http://localhost:5173"],
@@ -126,16 +107,24 @@ def create_app(
     )
 
     @app.exception_handler(RequestValidationError)
-    async def validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
+    async def validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
+        details = exc.errors()
+        if request.url.path == "/api/v2/settings/ai":
+            details = [
+                {key: value for key, value in error.items() if key in {"loc", "msg", "type"}}
+                for error in details
+            ]
         return JSONResponse(
             status_code=422,
-            content={
-                "error": {
-                    "code": "VALIDATION_ERROR",
-                    "message": "输入内容未通过校验",
-                    "details": exc.errors(),
+            content=jsonable_encoder(
+                {
+                    "error": {
+                        "code": "VALIDATION_ERROR",
+                        "message": "输入内容未通过校验",
+                        "details": details,
+                    }
                 }
-            },
+            ),
         )
 
     def session_dependency():
@@ -143,628 +132,621 @@ def create_app(
 
     DBSession = Annotated[Session, Depends(session_dependency)]
 
-    @app.get("/api/v1/health")
+    with database.session_factory() as session:
+        ensure_portfolio(session, settings.rule_config.values["portfolio"]["default_budget"])
+        for run in session.scalars(select(ReviewRun).where(ReviewRun.status.in_(["queued", "running"]))):
+            run.status = "failed"
+            run.error = "应用重启中断，可重新运行评估"
+            run.completed_at = datetime.now(UTC)
+        for run in session.scalars(select(DiscoveryRun).where(DiscoveryRun.status.in_(["queued", "running"]))):
+            run.status = "failed"
+            run.error = "应用重启中断，可重新运行探索"
+            run.completed_at = datetime.now(UTC)
+        session.commit()
+
+    def idempotency_lookup(
+        session: Session,
+        request: Request,
+        operation: str,
+        payload: object,
+    ) -> tuple[dict | None, str, str]:
+        key = request.headers.get("Idempotency-Key", "").strip()
+        request_json = json.dumps(jsonable_encoder(payload), ensure_ascii=False, sort_keys=True)
+        request_hash = hashlib.sha256(request_json.encode()).hexdigest()
+        if not key:
+            return None, "", request_hash
+        record = session.scalar(
+            select(IdempotencyRecord).where(
+                IdempotencyRecord.operation == operation,
+                IdempotencyRecord.idempotency_key == key,
+            )
+        )
+        if record is None:
+            return None, key, request_hash
+        if record.request_hash != request_hash:
+            raise HTTPException(409, "同一幂等键不能用于不同内容")
+        return json.loads(record.response_json), key, request_hash
+
+    def idempotency_save(
+        session: Session,
+        operation: str,
+        key: str,
+        request_hash: str,
+        response: dict,
+    ) -> None:
+        if not key:
+            return
+        session.add(
+            IdempotencyRecord(
+                operation=operation,
+                idempotency_key=key,
+                request_hash=request_hash,
+                response_json=json.dumps(response, ensure_ascii=False, default=str),
+            )
+        )
+        session.commit()
+
+    @app.get("/api/v2/health")
     def health(session: DBSession) -> dict:
-        session.execute(select(func.count()).select_from(Candidate)).scalar_one()
+        session.scalar(select(func.count()).select_from(Portfolio))
         return {
             "status": "ok",
             "database": "ok",
-            "ocr": "rapidocr" if ocr_service.available else "manual_review",
-            "market_provider": provider.status,
-            "ai": "deepseek" if settings.ai_enabled else "mock",
-            "risk_tolerance": settings.risk_tolerance,
+            "ocr": "rapidocr" if ocr.available else "manual_only",
+            "market_provider": market_provider.name,
+            "ai": ai_configuration_status(settings)["status"],
+            "rule_version": settings.rule_config.version,
         }
 
-    @app.get("/api/v1/dashboard")
-    def dashboard(session: DBSession) -> dict:
-        latest_day = session.scalar(select(func.max(Holding.snapshot_date)))
-        holdings = (
-            list(session.scalars(select(Holding).where(Holding.snapshot_date == latest_day)))
-            if latest_day
-            else []
+    @app.get("/api/v2/portfolio")
+    def get_portfolio(session: DBSession) -> dict:
+        portfolio = ensure_portfolio(session, settings.rule_config.values["portfolio"]["default_budget"])
+        snapshot = latest_snapshot(session, complete_only=True)
+        newest = latest_snapshot(session)
+        current_bucket_summary = (
+            bucket_allocation(
+                [{"amount": item.amount, "bucket": item.bucket} for item in snapshot.items],
+                settings.rule_config.values,
+            )
+            if snapshot
+            else {}
         )
-        total = sum(item.amount for item in holdings)
         return {
-            "candidate_count": session.scalar(select(func.count()).select_from(Candidate)) or 0,
-            "holding_count": len(holdings),
-            "portfolio_amount": round(total, 2),
-            "pending_imports": session.scalar(
-                select(func.count())
-                .select_from(ImportBatch)
-                .where(ImportBatch.status == "needs_review")
-            )
-            or 0,
-            "latest_snapshot_date": latest_day,
-            "risk_tolerance": settings.risk_tolerance,
+            "id": portfolio.id,
+            "name": portfolio.name,
+            "capital_budget": portfolio.capital_budget,
+            "updated_at": portfolio.updated_at,
+            "rule_version": settings.rule_config.version,
+            "buckets": settings.rule_config.values["buckets"],
+            "latest_snapshot": snapshot_json(snapshot),
+            "latest_draft": snapshot_json(newest) if newest and newest.completeness != "complete" else None,
+            "current_bucket_summary": current_bucket_summary,
         }
 
-    @app.get("/api/v1/candidates", response_model=list[CandidateRead])
-    def list_candidates(session: DBSession):
-        return list(session.scalars(select(Candidate).order_by(Candidate.created_at.desc())))
+    @app.put("/api/v2/portfolio")
+    def update_portfolio(payload: PortfolioUpdate, session: DBSession) -> dict:
+        portfolio = ensure_portfolio(session, settings.rule_config.values["portfolio"]["default_budget"])
+        portfolio.name = payload.name
+        portfolio.capital_budget = payload.capital_budget
+        session.commit()
+        return get_portfolio(session)
 
-    @app.post("/api/v1/candidates", response_model=CandidateRead, status_code=201)
-    def create_candidate(payload: CandidateCreate, session: DBSession):
-        existing = session.scalar(select(Candidate).where(Candidate.fund_code == payload.fund_code))
-        if existing:
-            raise HTTPException(status_code=409, detail="该基金已在候选列表中")
-        known = KNOWN_FUNDS.get(payload.fund_code)
-        candidate = Candidate(
-            fund_code=payload.fund_code,
-            fund_name=payload.fund_name or (known[0] if known else f"待刷新基金 {payload.fund_code}"),
-            share_class=payload.share_class or (known[2] if known else ""),
-            fund_type=payload.fund_type if payload.fund_type != "unknown" else (known[1] if known else "unknown"),
-            note=payload.note,
-            planned_amount=payload.planned_amount,
+    @app.get("/api/v2/portfolio/snapshots")
+    def list_snapshots(session: DBSession) -> list[dict]:
+        rows = list(session.scalars(select(HoldingSnapshot).options(selectinload(HoldingSnapshot.items).selectinload(HoldingItem.fund)).order_by(HoldingSnapshot.as_of_date.desc(), HoldingSnapshot.id.desc()).limit(50)))
+        return [snapshot_json(item) for item in rows]
+
+    @app.post("/api/v2/portfolio/snapshots", status_code=201)
+    def add_snapshot(payload: SnapshotCreate, request: Request, session: DBSession) -> dict:
+        existing, key, request_hash = idempotency_lookup(session, request, "create_snapshot", payload)
+        if existing is not None:
+            return existing
+        response = snapshot_json(create_snapshot(session, payload, settings.rule_config.values))
+        idempotency_save(session, "create_snapshot", key, request_hash, response)
+        return response
+
+    @app.put("/api/v2/funds/{code}/bucket")
+    def set_bucket(code: str, payload: BucketAssignmentUpdate, session: DBSession) -> dict:
+        fund = session.scalar(select(Fund).where(Fund.code == code))
+        if fund is None:
+            raise HTTPException(404, "基金不存在")
+        assignment = session.scalar(select(BucketAssignment).where(BucketAssignment.fund_id == fund.id))
+        if assignment is None:
+            assignment = BucketAssignment(fund_id=fund.id, bucket=payload.bucket, source="user", note=payload.note)
+            session.add(assignment)
+        else:
+            assignment.bucket, assignment.note, assignment.assigned_at = payload.bucket, payload.note, datetime.now(UTC)
+        session.commit()
+        return {"fund_code": code, "bucket": assignment.bucket, "source": "user"}
+
+    @app.get("/api/v2/funds", response_model=list[FundRead])
+    def list_funds(session: DBSession, q: str = ""):
+        query = select(Fund).order_by(Fund.updated_at.desc())
+        if q:
+            query = query.where((Fund.code.contains(q)) | (Fund.name.contains(q)))
+        return list(session.scalars(query.limit(100)))
+
+    @app.post("/api/v2/funds", response_model=FundRead, status_code=201)
+    def add_fund(payload: FundEnsure, session: DBSession):
+        fund = ensure_fund(session, payload.code, payload.name, payload.fund_type)
+        session.commit()
+        session.refresh(fund)
+        return fund
+
+    @app.get("/api/v2/funds/{code}")
+    def get_fund(code: str, session: DBSession) -> dict:
+        fund = session.scalar(select(Fund).where(Fund.code == code))
+        if fund is None:
+            raise HTTPException(404, "基金不存在")
+        nav = list(session.execute(select(NavPoint.nav_date, NavPoint.cumulative_nav, NavPoint.unit_nav).where(NavPoint.fund_id == fund.id).order_by(NavPoint.nav_date.desc()).limit(400)))
+        evidence = list(session.scalars(select(Evidence).where(Evidence.fund_id == fund.id).order_by(Evidence.published_at.desc()).limit(50)))
+        ordered_nav = list(reversed(nav))
+        cumulative_points = [(day, cumulative) for day, cumulative, _ in ordered_nav if cumulative is not None]
+        performance = (
+            calculate_window_metrics(cumulative_points, 252).as_dict()
+            if len(cumulative_points) >= 2
+            else None
         )
-        session.add(candidate)
-        session.commit()
-        session.refresh(candidate)
-        return candidate
+        return {
+            "fund": fund_dict(fund),
+            "nav": [{"date": day.isoformat(), "value": cumulative if cumulative is not None else unit, "total_return_quality": "ready" if cumulative is not None else "limited"} for day, cumulative, unit in ordered_nav],
+            "performance": performance,
+            "performance_chart": calculate_performance_chart(cumulative_points, 252),
+            "evidence": [{
+                "id": item.id, "title": item.title, "source_url": item.source_url,
+                "published_at": item.published_at.isoformat(), "source_level": item.source_level,
+                "event_type": item.event_type, "severity": item.severity, "verified": item.verified,
+            } for item in evidence],
+        }
 
-    @app.delete("/api/v1/candidates/{candidate_id}", status_code=204)
-    def delete_candidate(candidate_id: int, session: DBSession):
-        candidate = session.get(Candidate, candidate_id)
-        if not candidate:
-            raise HTTPException(status_code=404, detail="候选基金不存在")
-        session.execute(delete(NavPoint).where(NavPoint.candidate_id == candidate_id))
-        session.execute(delete(AnalysisReport).where(AnalysisReport.candidate_id == candidate_id))
-        session.execute(delete(Evidence).where(Evidence.candidate_id == candidate_id))
-        session.execute(delete(TriggerRule).where(TriggerRule.candidate_id == candidate_id))
-        session.delete(candidate)
-        session.commit()
-
-    @app.post("/api/v1/candidates/{candidate_id}/refresh", response_model=CandidateRead)
-    def refresh_candidate(candidate_id: int, session: DBSession):
-        candidate = session.get(Candidate, candidate_id)
-        if not candidate:
-            raise HTTPException(status_code=404, detail="候选基金不存在")
+    @app.post("/api/v2/funds/{code}/refresh")
+    def refresh(code: str, session: DBSession) -> dict:
         try:
-            data = provider.load(candidate.fund_code)
+            fund = refresh_fund(session, market_provider, code)
+            return get_fund(fund.code, session)
         except Exception as exc:
-            raise HTTPException(status_code=503, detail="公开数据刷新失败，请稍后重试") from exc
-        candidate.fund_name = data.fund_name
-        candidate.fund_type = data.fund_type
-        candidate.share_class = data.share_class
-        candidate.latest_nav = data.nav_points[-1][1]
-        candidate.nav_date = data.nav_points[-1][0]
-        candidate.data_source = data.source
-        candidate.refreshed_at = datetime.now(UTC)
-        session.execute(delete(NavPoint).where(NavPoint.candidate_id == candidate.id))
-        session.add_all(
-            [
-                NavPoint(
-                    candidate_id=candidate.id,
-                    nav_date=point_date,
-                    nav=nav,
-                    source=data.source,
-                )
-                for point_date, nav in data.nav_points[-1500:]
-            ]
-        )
-        session.commit()
-        session.refresh(candidate)
-        return candidate
+            cached = session.scalar(select(Fund).where(Fund.code == code))
+            if cached is not None and cached.value_date is not None:
+                cached.quality_status = "limited"
+                session.commit()
+                response = get_fund(code, session)
+                response["cache_used"] = True
+                response["warning"] = "实时刷新失败，当前展示已验证缓存；涉及质量和替代的结论已降级"
+                return response
+            raise HTTPException(503, "公开数据刷新失败；未使用演示数据，请检查网络或稍后重试") from exc
 
-    @app.post("/api/v1/reports")
-    def create_report(payload: ReportRequest, session: DBSession) -> dict:
-        candidate = session.get(Candidate, payload.candidate_id)
-        if not candidate:
-            raise HTTPException(status_code=404, detail="候选基金不存在")
-        points = list(
-            session.execute(
-                select(NavPoint.nav_date, NavPoint.nav)
-                .where(NavPoint.candidate_id == candidate.id)
-                .order_by(NavPoint.nav_date)
-            ).all()
-        )
-        if not points:
-            data = provider.load(candidate.fund_code)
-            candidate.fund_name = data.fund_name
-            candidate.fund_type = data.fund_type
-            candidate.share_class = data.share_class
-            candidate.latest_nav = data.nav_points[-1][1]
-            candidate.nav_date = data.nav_points[-1][0]
-            candidate.data_source = data.source
-            candidate.refreshed_at = datetime.now(UTC)
-            session.add_all(
-                [
-                    NavPoint(
-                        candidate_id=candidate.id,
-                        nav_date=point_date,
-                        nav=nav,
-                        source=data.source,
-                    )
-                    for point_date, nav in data.nav_points[-1500:]
-                ]
-            )
-            session.flush()
-            points = data.nav_points
-        metrics = calculate_metrics(points)
-        latest_day = session.scalar(select(func.max(Holding.snapshot_date)))
-        holdings = (
-            list(session.scalars(select(Holding).where(Holding.snapshot_date == latest_day)))
-            if latest_day
-            else []
-        )
-        total = sum(item.amount for item in holdings)
-        current = sum(item.amount for item in holdings if item.fund_code == candidate.fund_code)
-        current_weight = current / total if total else 0.0
-        decision = build_decision(
-            metrics,
-            DecisionContext(
-                fund_name=candidate.fund_name,
-                fund_type=candidate.fund_type,
-                horizon=payload.horizon,
-                current_weight=current_weight,
-                data_source=candidate.data_source,
-                risk_tolerance=settings.risk_tolerance,
-            ),
-        )
-        result = {
-            "candidate": CandidateRead.model_validate(candidate).model_dump(mode="json"),
-            "horizon": payload.horizon,
-            "as_of_date": metrics.as_of_date.isoformat(),
-            "metrics": metrics.as_dict(),
-            "current_weight": current_weight,
-            "decision": decision,
-            "evidence": [
-                EvidenceRead.model_validate(item).model_dump(mode="json")
-                for item in session.scalars(
-                    select(Evidence)
-                    .where(Evidence.candidate_id == candidate.id)
-                    .order_by(Evidence.published_at.desc())
-                )
-            ],
-            "ai_explanation": {
-                "status": "not_generated",
-                "message": "MVP 先展示确定性结论；AI 仅在设置启用并提供 Evidence Pack 后解释",
-            },
-        }
-        report = AnalysisReport(
-            candidate_id=candidate.id,
-            horizon=payload.horizon,
-            result_json=json.dumps(result, ensure_ascii=False),
-        )
-        session.add(report)
-        session.commit()
-        result["report_id"] = report.id
-        return result
-
-    @app.get("/api/v1/reports/{report_id}")
-    def get_report(report_id: int, session: DBSession):
-        report = session.get(AnalysisReport, report_id)
-        if not report:
-            raise HTTPException(status_code=404, detail="研究报告不存在")
-        result = json.loads(report.result_json)
-        result["report_id"] = report.id
-        return result
-
-    @app.post("/api/v1/reports/{report_id}/explain")
-    async def explain(report_id: int, session: DBSession):
-        report = session.get(AnalysisReport, report_id)
-        if not report:
-            raise HTTPException(status_code=404, detail="研究报告不存在")
-        result = json.loads(report.result_json)
-        evidence_rows = list(
-            session.scalars(
-                select(Evidence)
-                .where(Evidence.candidate_id == report.candidate_id)
-                .order_by(Evidence.published_at.desc())
-                .limit(20)
-            )
-        )
-        evidence_pack = [
-            {
-                "evidence_id": f"ev_{item.id}",
-                "title": item.title,
-                "source_url": item.source_url,
-                "published_at": item.published_at.isoformat(),
-                "trust_level": item.trust_level,
-                "content": item.content,
-            }
-            for item in evidence_rows
-        ]
-        safe_report = {
-            "candidate": result["candidate"],
-            "horizon": result["horizon"],
-            "as_of_date": result["as_of_date"],
-            "metrics": result["metrics"],
-            "decision": result["decision"],
-        }
-        result["evidence"] = evidence_pack
-        result["ai_explanation"] = await explain_report(settings, safe_report, evidence_pack)
-        report.result_json = json.dumps(result, ensure_ascii=False)
-        session.commit()
-        result["report_id"] = report.id
-        return result
-
-    @app.get("/api/v1/evidence", response_model=list[EvidenceRead])
-    def list_evidence(candidate_id: int, session: DBSession):
-        return list(
-            session.scalars(
-                select(Evidence)
-                .where(Evidence.candidate_id == candidate_id)
-                .order_by(Evidence.published_at.desc())
-            )
-        )
-
-    @app.post("/api/v1/evidence", response_model=EvidenceRead, status_code=201)
-    def create_evidence(payload: EvidenceCreate, session: DBSession):
-        if not session.get(Candidate, payload.candidate_id):
-            raise HTTPException(status_code=404, detail="候选基金不存在")
-        digest = hashlib.sha256(
-            f"{payload.source_url}|{payload.published_at}|{payload.content}".encode()
+    @app.post("/api/v2/evidence/manual", status_code=201)
+    def add_evidence(payload: EvidenceCreate, session: DBSession) -> dict:
+        fund = None
+        if payload.fund_code:
+            fund = session.scalar(select(Fund).where(Fund.code == payload.fund_code))
+            if fund is None:
+                fund = ensure_fund(session, payload.fund_code)
+        event_type, severity = classify_event(payload.title)
+        if payload.event_type != "other":
+            event_type = payload.event_type
+            severity = "critical" if event_type in {"liquidation", "redemption_suspension", "contract_termination"} else "high"
+        source_level = "B" if payload.evidence_kind == "news" else payload.source_level
+        content_hash = hashlib.sha256(
+            f"{payload.fund_code}|{payload.title}|{payload.published_at}|{payload.source_url}|{payload.content}".encode()
         ).hexdigest()
-        existing = session.scalar(
-            select(Evidence).where(
-                Evidence.candidate_id == payload.candidate_id,
-                Evidence.content_hash == digest,
-            )
-        )
+        existing = session.scalar(select(Evidence).where(Evidence.content_hash == content_hash))
         if existing:
-            raise HTTPException(status_code=409, detail="该证据已存在")
-        evidence = Evidence(**payload.model_dump(), content_hash=digest)
+            raise HTTPException(409, "该证据已存在")
+        evidence = Evidence(
+            fund_id=fund.id if fund else None, evidence_kind=payload.evidence_kind,
+            title=payload.title, source_url=payload.source_url, source_level=source_level,
+            published_at=payload.published_at, available_from=payload.published_at,
+            content=payload.content, content_hash=content_hash, event_type=event_type,
+            severity=severity, verified=payload.verified,
+        )
         session.add(evidence)
         session.commit()
         session.refresh(evidence)
-        return evidence
+        return {"id": evidence.id, "event_type": evidence.event_type, "severity": evidence.severity, "verified": evidence.verified}
 
-    @app.delete("/api/v1/evidence/{evidence_id}", status_code=204)
-    def delete_evidence(evidence_id: int, session: DBSession):
-        evidence = session.get(Evidence, evidence_id)
-        if not evidence:
-            raise HTTPException(status_code=404, detail="证据不存在")
-        session.delete(evidence)
-        session.commit()
+    def run_review_task(run_id: int) -> None:
+        with database.session_factory() as task_session:
+            run = task_session.get(ReviewRun, run_id)
+            if run:
+                try:
+                    process_review(task_session, market_provider, run, settings.rule_config.values)
+                except Exception as exc:  # defensive task boundary
+                    run.status, run.data_quality, run.verdict = "failed", "blocked", "review"
+                    run.error = f"{type(exc).__name__}: 评估任务失败"
+                    run.completed_at = datetime.now(UTC)
+                    task_session.commit()
 
-    @app.get("/api/v1/holdings", response_model=list[HoldingRead])
-    def list_holdings(session: DBSession):
-        return list(
-            session.scalars(
-                select(Holding).order_by(Holding.snapshot_date.desc(), Holding.created_at.desc())
-            )
+    @app.post("/api/v2/reviews", status_code=202)
+    def start_review(background: BackgroundTasks, session: DBSession) -> dict:
+        snapshot = latest_snapshot(session, complete_only=True)
+        if snapshot is None:
+            raise HTTPException(409, "请先确认一份完整持仓快照")
+        fingerprint = run_fingerprint(snapshot, settings.rule_config.sha256)
+        existing = session.scalar(select(ReviewRun).where(ReviewRun.input_fingerprint == fingerprint, ReviewRun.status.in_(["queued", "running"])).order_by(ReviewRun.id.desc()))
+        if existing:
+            return {"run_id": existing.id, "status": existing.status}
+        run = ReviewRun(
+            snapshot_id=snapshot.id, status="queued", progress=0, verdict="review",
+            data_quality="limited", as_of_date=date.today(), rule_version=settings.rule_config.version,
+            rule_hash=settings.rule_config.sha256, input_fingerprint=fingerprint,
         )
-
-    @app.post("/api/v1/holdings", response_model=HoldingRead, status_code=201)
-    def create_holding(payload: HoldingCreate, session: DBSession):
-        holding = Holding(**payload.model_dump())
-        session.add(holding)
+        session.add(run)
         session.commit()
-        session.refresh(holding)
-        return holding
+        session.refresh(run)
+        background.add_task(run_review_task, run.id)
+        return {"run_id": run.id, "status": run.status}
 
-    @app.delete("/api/v1/holdings/{holding_id}", status_code=204)
-    def delete_holding(holding_id: int, session: DBSession):
-        holding = session.get(Holding, holding_id)
-        if not holding:
-            raise HTTPException(status_code=404, detail="持仓不存在")
-        session.delete(holding)
-        session.commit()
+    @app.get("/api/v2/reviews")
+    def list_reviews(session: DBSession) -> list[dict]:
+        runs = list(session.scalars(select(ReviewRun).options(selectinload(ReviewRun.items).selectinload(ReviewItem.fund), selectinload(ReviewRun.items).selectinload(ReviewItem.decision)).order_by(ReviewRun.id.desc()).limit(50)))
+        return [review_json(run) for run in runs]
 
-    @app.get("/api/v1/transactions", response_model=list[TransactionRead])
-    def list_transactions(session: DBSession):
-        return list(session.scalars(select(Transaction).order_by(Transaction.trade_time.desc())))
+    @app.get("/api/v2/reviews/latest")
+    def latest_review(session: DBSession) -> dict | None:
+        run = session.scalar(select(ReviewRun).options(selectinload(ReviewRun.items).selectinload(ReviewItem.fund), selectinload(ReviewRun.items).selectinload(ReviewItem.decision)).order_by(ReviewRun.id.desc()))
+        return review_json(run) if run else None
 
-    @app.post("/api/v1/transactions", response_model=TransactionRead, status_code=201)
-    def create_transaction(payload: TransactionCreate, session: DBSession):
-        transaction = Transaction(
-            **payload.model_dump(),
-            fingerprint=transaction_fingerprint(payload),
+    @app.get("/api/v2/reviews/{run_id}")
+    def get_review(run_id: int, session: DBSession) -> dict:
+        run = session.scalar(select(ReviewRun).options(selectinload(ReviewRun.items).selectinload(ReviewItem.fund), selectinload(ReviewRun.items).selectinload(ReviewItem.decision)).where(ReviewRun.id == run_id))
+        if run is None:
+            raise HTTPException(404, "评估不存在")
+        return review_json(run)
+
+    @app.post("/api/v2/review-items/{item_id}/decision")
+    def decide(item_id: int, payload: ReviewDecisionCreate, request: Request, session: DBSession) -> dict:
+        existing, key, request_hash = idempotency_lookup(
+            session, request, f"review_decision:{item_id}", payload
         )
-        session.add(transaction)
+        if existing is not None:
+            return existing
+        item = session.get(ReviewItem, item_id)
+        if item is None:
+            raise HTTPException(404, "复核事项不存在")
+        decision = session.scalar(select(ReviewDecision).where(ReviewDecision.item_id == item_id))
+        if decision is None:
+            decision = ReviewDecision(item_id=item_id, user_choice=payload.user_choice, note=payload.note)
+            session.add(decision)
+        else:
+            decision.user_choice, decision.note, decision.decided_at = payload.user_choice, payload.note, datetime.now(UTC)
+        item.status = {"agree": "acknowledged", "reject": "dismissed", "defer": "deferred"}[payload.user_choice]
+        session.commit()
+        response = {"item_id": item_id, "status": item.status, "choice": payload.user_choice}
+        idempotency_save(session, f"review_decision:{item_id}", key, request_hash, response)
+        return response
+
+    @app.get("/api/v2/funds/{code}/alternatives")
+    def alternatives(code: str, session: DBSession) -> list[dict]:
+        fund = session.scalar(select(Fund).where(Fund.code == code))
+        if fund is None:
+            raise HTTPException(404, "基金不存在")
         try:
-            session.commit()
-        except IntegrityError as exc:
-            session.rollback()
-            raise HTTPException(status_code=409, detail="该交易记录已存在") from exc
-        session.refresh(transaction)
-        return transaction
+            fund = refresh_fund(session, market_provider, code)
+        except Exception as exc:
+            raise HTTPException(503, "当前基金最新净值或申赎状态无法复核，替代结论已阻断") from exc
+        snapshot = latest_snapshot(session, complete_only=True)
+        bucket = fund.default_bucket
+        if snapshot:
+            holding = next((item for item in snapshot.items if item.fund_id == fund.id), None)
+            if holding:
+                bucket = holding.bucket
+        with suppress(Exception):
+            prepare_peer_universe(session, market_provider, fund)
+        # 已缓存同类仍可比较；生产模式绝不回退到演示数据。
+        return alternatives_for(session, fund, bucket, settings.rule_config.values)
 
-    @app.delete("/api/v1/transactions/{transaction_id}", status_code=204)
-    def delete_transaction(transaction_id: int, session: DBSession):
-        transaction = session.get(Transaction, transaction_id)
-        if not transaction:
-            raise HTTPException(status_code=404, detail="交易不存在")
-        session.delete(transaction)
-        session.commit()
+    def run_discovery_task(run_id: int) -> None:
+        with database.session_factory() as task_session:
+            run = task_session.get(DiscoveryRun, run_id)
+            if run:
+                try:
+                    process_discovery(task_session, market_provider, run, settings.rule_config.values)
+                except Exception as exc:  # defensive task boundary
+                    run.status = "failed"
+                    run.error = f"{type(exc).__name__}: 基金探索任务失败"
+                    run.completed_at = datetime.now(UTC)
+                    task_session.commit()
 
-    @app.post("/api/v1/imports", response_model=ImportBatchRead, status_code=201)
-    async def create_import(
-        session: DBSession,
-        image: Annotated[UploadFile, File()],
-    ):
-        if image.content_type not in ALLOWED_IMAGE_TYPES:
-            raise HTTPException(status_code=415, detail="只支持 JPG、PNG 或 WebP 图片")
-        content = await image.read(MAX_UPLOAD_BYTES + 1)
-        if len(content) > MAX_UPLOAD_BYTES:
-            raise HTTPException(status_code=413, detail="单张图片不能超过 12 MB")
-        if Image is not None:
-            try:
-                with Image.open(io.BytesIO(content)) as decoded:
-                    decoded.verify()
-                    width, height = decoded.size
-                if width * height > 40_000_000:
-                    raise HTTPException(status_code=413, detail="图片像素过大")
-            except HTTPException:
-                raise
-            except Exception as exc:
-                raise HTTPException(status_code=422, detail="图片内容无法安全解码") from exc
-        content_hash = hashlib.sha256(content).hexdigest()
+    @app.post("/api/v2/discoveries", status_code=202)
+    def start_discovery(background: BackgroundTasks, session: DBSession) -> dict:
+        snapshot = latest_snapshot(session, complete_only=True)
+        if snapshot is None:
+            raise HTTPException(409, "请先确认一份完整持仓快照")
         existing = session.scalar(
-            select(ImportBatch)
-            .options(selectinload(ImportBatch.items))
-            .where(ImportBatch.content_hash == content_hash)
+            select(DiscoveryRun)
+            .where(DiscoveryRun.status.in_(["queued", "running"]))
+            .order_by(DiscoveryRun.id.desc())
         )
         if existing:
-            raise HTTPException(status_code=409, detail=f"该图片已在导入批次 #{existing.id} 中")
-        suffix = ALLOWED_IMAGE_TYPES[image.content_type]
-        destination = settings.upload_dir / f"{content_hash}{suffix}"
-        destination.write_bytes(content)
-        raw_text, scores = ocr_service.extract(destination)
-        page_type, drafts = parse_ocr_text(raw_text)
-        average_score = sum(scores) / len(scores) if scores else 0.0
-        batch = ImportBatch(
-            filename=Path(image.filename or f"upload{suffix}").name,
-            content_hash=content_hash,
-            image_path=str(destination),
-            page_type=page_type,
-            raw_text=raw_text,
-            status="needs_review",
-            error="" if ocr_service.available else "RapidOCR 未安装，请人工填写草稿字段",
+            return {"run_id": existing.id, "status": existing.status}
+        run = DiscoveryRun(
+            snapshot_id=snapshot.id,
+            status="queued",
+            progress=0,
+            rule_version=settings.rule_config.version,
+            rule_hash=settings.rule_config.sha256,
         )
-        for draft in drafts:
-            batch.items.append(
-                ImportItem(
-                    kind=draft.kind,
-                    fund_code=draft.fund_code,
-                    fund_name=draft.fund_name,
-                    action=draft.action,
-                    amount=draft.amount,
-                    shares=draft.shares,
-                    event_time=draft.event_time,
-                    confidence=min(draft.confidence, average_score or draft.confidence),
-                    issues=draft.issues,
-                )
+        session.add(run)
+        session.commit()
+        session.refresh(run)
+        background.add_task(run_discovery_task, run.id)
+        return {"run_id": run.id, "status": run.status}
+
+    @app.get("/api/v2/discoveries/latest")
+    def latest_discovery(session: DBSession) -> dict | None:
+        run = session.scalar(select(DiscoveryRun).order_by(DiscoveryRun.id.desc()))
+        return discovery_json(run) if run else None
+
+    @app.get("/api/v2/discoveries/{run_id}")
+    def get_discovery(run_id: int, session: DBSession) -> dict:
+        run = session.get(DiscoveryRun, run_id)
+        if run is None:
+            raise HTTPException(404, "基金探索不存在")
+        return discovery_json(run)
+
+    @app.post("/api/v2/reviews/{run_id}/explain")
+    async def explain(run_id: int, session: DBSession) -> dict:
+        run = session.scalar(select(ReviewRun).options(selectinload(ReviewRun.items).selectinload(ReviewItem.fund), selectinload(ReviewRun.items).selectinload(ReviewItem.decision)).where(ReviewRun.id == run_id))
+        if run is None:
+            raise HTTPException(404, "评估不存在")
+        visible_items = [item for item in run.items if item.reason_type != "band_breach"]
+        ids = sorted({evidence_id for item in visible_items for evidence_id in json.loads(item.evidence_ids_json or "[]")})
+        evidence_rows = list(session.scalars(select(Evidence).where(Evidence.id.in_(ids)).limit(8))) if ids else []
+        pack = [{
+            "evidence_id": f"ev_{item.id}", "title": item.title, "source_url": item.source_url,
+            "published_at": item.published_at.isoformat(), "source_level": item.source_level,
+            "content": item.content[:1600],
+        } for item in evidence_rows]
+        safe_review = {
+            "verdict": review_json(run)["verdict"], "data_quality": run.data_quality,
+            "as_of_date": run.as_of_date.isoformat(),
+            "items": [{
+                "reason_type": item.reason_type,
+                "proposed_action": item.proposed_action,
+                "title": item.title,
+                "metrics": {
+                    key: value
+                    for key, value in json.loads(item.metric_json or "{}").items()
+                    if key not in {"amount", "target_amount", "target_delta", "market_value"}
+                },
+            } for item in visible_items],
+        }
+        pack_ids = [item["evidence_id"] for item in pack]
+        cached = session.scalar(
+            select(AiRun)
+            .where(
+                AiRun.review_run_id == run.id,
+                AiRun.model == settings.deepseek_model,
+                AiRun.status == "ok",
+                AiRun.evidence_ids_json == json.dumps(pack_ids),
+                AiRun.prompt_version == AI_PROMPT_VERSION,
+                AiRun.schema_version == AI_SCHEMA_VERSION,
             )
-        session.add(batch)
-        session.commit()
-        return session.scalar(
-            select(ImportBatch)
-            .options(selectinload(ImportBatch.items))
-            .where(ImportBatch.id == batch.id)
+            .order_by(AiRun.id.desc())
         )
-
-    @app.get("/api/v1/imports", response_model=list[ImportBatchRead])
-    def list_imports(session: DBSession):
-        return list(
-            session.scalars(
-                select(ImportBatch)
-                .options(selectinload(ImportBatch.items))
-                .order_by(ImportBatch.created_at.desc())
-            ).unique()
-        )
-
-    @app.get("/api/v1/imports/{batch_id}", response_model=ImportBatchRead)
-    def get_import(batch_id: int, session: DBSession):
-        batch = session.scalar(
-            select(ImportBatch)
-            .options(selectinload(ImportBatch.items))
-            .where(ImportBatch.id == batch_id)
-        )
-        if not batch:
-            raise HTTPException(status_code=404, detail="导入批次不存在")
-        return batch
-
-    @app.put("/api/v1/import-items/{item_id}", response_model=ImportItemRead)
-    def update_import_item(item_id: int, payload: ImportItemUpdate, session: DBSession):
-        item = session.get(ImportItem, item_id)
-        if not item:
-            raise HTTPException(status_code=404, detail="导入草稿不存在")
-        if item.confirmed:
-            raise HTTPException(status_code=409, detail="已确认草稿不能直接修改")
-        for key, value in payload.model_dump().items():
-            setattr(item, key, value)
-        item.confidence = 1.0
-        item.issues = ""
+        if cached is not None:
+            return {**json.loads(cached.result_json), "cached": True, "created_at": cached.created_at.isoformat()}
+        result = await explain_review(settings, safe_review, pack)
+        session.add(AiRun(
+            review_run_id=run.id, model=settings.deepseek_model, status=result["status"],
+            prompt_version=AI_PROMPT_VERSION, schema_version=AI_SCHEMA_VERSION,
+            evidence_ids_json=json.dumps(pack_ids),
+            result_json=json.dumps(result, ensure_ascii=False),
+        ))
         session.commit()
-        session.refresh(item)
-        return item
+        return result
 
-    @app.post("/api/v1/imports/{batch_id}/confirm", response_model=ImportBatchRead)
-    def confirm_import(batch_id: int, session: DBSession):
-        batch = session.scalar(
-            select(ImportBatch)
-            .options(selectinload(ImportBatch.items))
-            .where(ImportBatch.id == batch_id)
-        )
-        if not batch:
-            raise HTTPException(status_code=404, detail="导入批次不存在")
-        pending = [item for item in batch.items if not item.confirmed]
-        if not pending:
-            raise HTTPException(status_code=409, detail="该批次没有待确认记录")
-        confirmed_count = 0
-        for item in pending:
-            if not item.fund_code or not item.fund_name:
-                item.issues = "缺少基金代码或名称，未写入正式数据"
-                continue
-            if item.kind == "candidate":
-                existing = session.scalar(
-                    select(Candidate).where(Candidate.fund_code == item.fund_code)
-                )
-                if not existing:
-                    known = KNOWN_FUNDS.get(item.fund_code)
-                    session.add(
-                        Candidate(
-                            fund_code=item.fund_code,
-                            fund_name=item.fund_name,
-                            share_class=known[2] if known else "",
-                            fund_type=known[1] if known else "unknown",
-                            data_source="支付宝截图（已确认）",
-                        )
-                    )
-            elif item.kind == "holding":
-                if item.amount is None:
-                    item.issues = "缺少持仓金额，未写入正式数据"
-                    continue
-                session.add(
-                    Holding(
-                        fund_code=item.fund_code,
-                        fund_name=item.fund_name,
-                        amount=item.amount,
-                        snapshot_date=(item.event_time or datetime.now(UTC)).date(),
-                        source=f"截图导入批次 #{batch.id}",
-                    )
-                )
-            elif item.kind == "transaction":
-                if item.event_time is None or (item.amount is None and item.shares is None):
-                    item.issues = "缺少交易时间、金额或份额，未写入正式数据"
-                    continue
-                payload = TransactionCreate(
-                    fund_code=item.fund_code,
-                    fund_name=item.fund_name,
-                    action=item.action or "buy",
-                    amount=item.amount,
-                    shares=item.shares,
-                    trade_time=item.event_time,
-                    source=f"截图导入批次 #{batch.id}",
-                )
-                fingerprint = transaction_fingerprint(payload)
-                if not session.scalar(
-                    select(Transaction).where(Transaction.fingerprint == fingerprint)
-                ):
-                    session.add(Transaction(**payload.model_dump(), fingerprint=fingerprint))
-            item.confirmed = True
-            confirmed_count += 1
-        if confirmed_count == 0:
-            session.commit()
-            raise HTTPException(status_code=422, detail="没有可确认记录，请先修正高亮字段")
-        batch.status = "confirmed" if all(item.confirmed for item in batch.items) else "partially_confirmed"
-        if not settings.keep_uploads and batch.image_path:
-            image_path = Path(batch.image_path)
-            if image_path.is_file():
-                image_path.unlink()
-            batch.image_path = ""
-        session.commit()
-        return session.scalar(
-            select(ImportBatch)
-            .options(selectinload(ImportBatch.items))
-            .where(ImportBatch.id == batch.id)
-        )
-
-    @app.delete("/api/v1/imports/{batch_id}", status_code=204)
-    def delete_import(batch_id: int, session: DBSession):
-        batch = session.get(ImportBatch, batch_id)
-        if not batch:
-            raise HTTPException(status_code=404, detail="导入批次不存在")
-        image_path = Path(batch.image_path) if batch.image_path else None
-        session.delete(batch)
-        session.commit()
-        if image_path and image_path.is_file():
-            image_path.unlink()
-
-    @app.get("/api/v1/triggers", response_model=list[TriggerRead])
-    def list_triggers(session: DBSession):
-        return list(session.scalars(select(TriggerRule).order_by(TriggerRule.id.desc())))
-
-    @app.post("/api/v1/triggers", response_model=TriggerRead, status_code=201)
-    def create_trigger(payload: TriggerCreate, session: DBSession):
-        if not session.get(Candidate, payload.candidate_id):
-            raise HTTPException(status_code=404, detail="候选基金不存在")
-        trigger = TriggerRule(**payload.model_dump())
-        session.add(trigger)
-        session.commit()
-        session.refresh(trigger)
-        return trigger
-
-    @app.delete("/api/v1/triggers/{trigger_id}", status_code=204)
-    def delete_trigger(trigger_id: int, session: DBSession):
-        trigger = session.get(TriggerRule, trigger_id)
-        if not trigger:
-            raise HTTPException(status_code=404, detail="触发器不存在")
-        session.delete(trigger)
-        session.commit()
-
-    @app.post("/api/v1/triggers/check", response_model=list[TriggerRead])
-    def check_triggers(session: DBSession):
-        triggers = list(session.scalars(select(TriggerRule).where(TriggerRule.enabled.is_(True))))
-        for trigger in triggers:
-            candidate = session.get(Candidate, trigger.candidate_id)
-            points = list(
-                session.execute(
-                    select(NavPoint.nav_date, NavPoint.nav)
-                    .where(NavPoint.candidate_id == trigger.candidate_id)
-                    .order_by(NavPoint.nav_date)
-                ).all()
+    @app.get("/api/v2/reviews/{run_id}/explanation")
+    def get_explanation(run_id: int, session: DBSession) -> dict | None:
+        if session.get(ReviewRun, run_id) is None:
+            raise HTTPException(404, "评估不存在")
+        ai_run = session.scalar(
+            select(AiRun)
+            .where(
+                AiRun.review_run_id == run_id,
+                AiRun.prompt_version == AI_PROMPT_VERSION,
+                AiRun.schema_version == AI_SCHEMA_VERSION,
             )
-            if not candidate or not points:
-                trigger.last_value = None
-                trigger.last_matched = False
-                trigger.checked_at = datetime.now(UTC)
-                continue
-            metrics = calculate_metrics(points)
-            values = {
-                "latest_nav": candidate.latest_nav,
-                "drawdown": metrics.max_drawdown,
-                "annualized_return": metrics.annualized_return,
-                "volatility": metrics.volatility,
-            }
-            value = values[trigger.metric]
-            trigger.last_value = value
-            trigger.last_matched = (
-                _operator_matches(value, trigger.operator, trigger.threshold)
-                if value is not None
-                else False
-            )
-            trigger.checked_at = datetime.now(UTC)
-        session.commit()
-        return triggers
-
-    @app.get("/api/v1/settings")
-    def get_settings() -> dict:
+            .order_by(AiRun.id.desc())
+        )
+        if ai_run is None:
+            return None
         return {
-            "risk_tolerance": settings.risk_tolerance,
-            "market_provider": provider.status,
-            "ocr": "rapidocr" if ocr_service.available else "manual_review",
-            "ai_enabled": settings.ai_enabled,
-            "ai_model": settings.deepseek_model or "未配置",
-            "keep_uploads": settings.keep_uploads,
+            **json.loads(ai_run.result_json or "{}"),
+            "status": ai_run.status,
+            "model": ai_run.model,
+            "created_at": ai_run.created_at.isoformat(),
+            "cached": True,
         }
 
-    @app.get("/api/v1/exports/full")
-    def export_full(session: DBSession):
-        payload = {
-            "exported_at": datetime.now(UTC),
-            "schema": "fundlab-mvp-export-v1",
-            "candidates": [
-                CandidateRead.model_validate(item).model_dump(mode="json")
-                for item in session.scalars(select(Candidate).order_by(Candidate.id))
-            ],
-            "holdings": [
-                HoldingRead.model_validate(item).model_dump(mode="json")
-                for item in session.scalars(select(Holding).order_by(Holding.id))
-            ],
-            "transactions": [
-                TransactionRead.model_validate(item).model_dump(mode="json")
-                for item in session.scalars(select(Transaction).order_by(Transaction.id))
-            ],
-            "evidence": [
-                EvidenceRead.model_validate(item).model_dump(mode="json")
-                for item in session.scalars(select(Evidence).order_by(Evidence.id))
-            ],
-            "triggers": [
-                TriggerRead.model_validate(item).model_dump(mode="json")
-                for item in session.scalars(select(TriggerRule).order_by(TriggerRule.id))
-            ],
+    @app.get("/api/v2/data-health")
+    def data_health(session: DBSession) -> dict:
+        blocked = session.scalar(select(func.count()).select_from(Fund).where(Fund.quality_status == "blocked")) or 0
+        limited = session.scalar(select(func.count()).select_from(Fund).where(Fund.quality_status == "limited")) or 0
+        latest_fetch = session.scalar(select(func.max(ProviderSnapshot.fetched_at)))
+        ai_configuration = ai_configuration_status(settings)
+        return {
+            "provider": market_provider.name,
+            "fund_count": session.scalar(select(func.count()).select_from(Fund)) or 0,
+            "blocked_funds": blocked,
+            "limited_funds": limited,
+            "latest_fetch": latest_fetch,
+            "ocr": "ready" if ocr.available else "manual_only",
+            "ai": ai_configuration["status"],
+            "ai_config": ai_configuration,
         }
-        filename = f"fundlab-export-{date.today().isoformat()}.json"
-        return JSONResponse(
-            content=jsonable_encoder(payload),
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-        )
 
-    @app.post("/api/v1/settings/ai/test")
+    @app.get("/api/v2/rule-config")
+    def rule_config() -> dict:
+        return {"version": settings.rule_config.version, "sha256": settings.rule_config.sha256, "rules": settings.rule_config.values}
+
+    def require_local_settings_request(request: Request) -> None:
+        host = request.client.host if request.client else ""
+        if host not in {"127.0.0.1", "::1", "localhost", "testclient"}:
+            raise HTTPException(403, "AI 配置只允许从本机修改")
+
+    @app.get("/api/v2/settings/ai")
+    def get_ai_settings() -> dict:
+        return ai_configuration_status(settings)
+
+    @app.put("/api/v2/settings/ai")
+    def save_ai_settings(payload: AiSettingsUpdate, request: Request) -> dict:
+        nonlocal settings
+        require_local_settings_request(request)
+        requested_keys = {"FUNDLAB_AI_ENABLED", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL"}
+        if payload.api_key is not None or payload.clear_api_key:
+            requested_keys.add("DEEPSEEK_API_KEY")
+        overridden = sorted(requested_keys.intersection(os.environ))
+        if overridden:
+            raise HTTPException(409, f"以下配置由启动环境覆盖，无法从页面修改：{'、'.join(overridden)}")
+
+        key_value = None if payload.clear_api_key else payload.api_key
+        updates: dict[str, str | None] = {
+            "FUNDLAB_AI_ENABLED": "true" if payload.enabled else "false",
+            "DEEPSEEK_BASE_URL": payload.base_url,
+            "DEEPSEEK_MODEL": payload.model,
+        }
+        if payload.clear_api_key or payload.api_key is not None:
+            updates["DEEPSEEK_API_KEY"] = key_value
+        update_local_env(settings.project_root / ".env", updates)
+        refreshed = Settings.from_env(settings.project_root)
+        if database_url is not None:
+            refreshed = replace(refreshed, database_url=database_url)
+        settings = refreshed
+        app.state.settings = refreshed
+        return {**ai_configuration_status(settings), "message": "AI 配置已保存并即时生效"}
+
+    @app.post("/api/v2/settings/ai/test")
     async def ai_test() -> dict:
         return await test_deepseek(settings)
+
+    @app.get("/api/v2/exports/full")
+    def export_full(session: DBSession) -> JSONResponse:
+        portfolio = get_portfolio(session)
+        reviews = list_reviews(session)
+        funds = [fund_dict(item) for item in session.scalars(select(Fund).order_by(Fund.code))]
+        response = JSONResponse(jsonable_encoder({"exported_at": datetime.now(UTC).isoformat(), "portfolio": portfolio, "funds": funds, "reviews": reviews}))
+        response.headers["Content-Disposition"] = f'attachment; filename="fundlab-v2-{date.today().isoformat()}.json"'
+        return response
+
+    @app.post("/api/v2/imports", status_code=201)
+    async def upload_import(session: DBSession, image: UploadFile = File(...)):
+        if image.content_type not in ALLOWED_IMAGE_TYPES:
+            raise HTTPException(415, "只支持 JPG、PNG 或 WebP")
+        content = await image.read(MAX_UPLOAD_BYTES + 1)
+        if len(content) > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, "图片不能超过 12MB")
+        digest = hashlib.sha256(content).hexdigest()
+        existing = session.scalar(select(ImportBatch).where(ImportBatch.content_hash == digest))
+        if existing:
+            raise HTTPException(409, "该图片已经导入")
+        suffix = ALLOWED_IMAGE_TYPES[image.content_type]
+        path = settings.upload_dir / f"{digest}{suffix}"
+        path.write_bytes(content)
+        if Image is not None:
+            try:
+                with Image.open(path) as opened:
+                    opened.verify()
+            except Exception as exc:
+                path.unlink(missing_ok=True)
+                raise HTTPException(400, "图片文件损坏或格式不合法") from exc
+        batch = ImportBatch(filename=image.filename or path.name, content_hash=digest, image_path=str(path), status="uploaded")
+        session.add(batch)
+        session.commit()
+        session.refresh(batch)
+        return {"id": batch.id, "filename": batch.filename, "status": batch.status, "items": []}
+
+    @app.post("/api/v2/imports/{batch_id}/process")
+    def process_import(batch_id: int, session: DBSession) -> dict:
+        batch = session.get(ImportBatch, batch_id)
+        if batch is None:
+            raise HTTPException(404, "导入批次不存在")
+        try:
+            text, scores, boxes = ocr.extract(Path(batch.image_path))
+            local_catalog = [(fund.code, fund.name) for fund in session.scalars(select(Fund))]
+            resolved = match_fund_catalog(text, local_catalog)
+            if len(resolved) < 2:
+                with suppress(Exception):
+                    public_resolved = market_provider.resolve_fund_names(text, limit=30)
+                    by_code = {item[0]: item for item in resolved}
+                    for item in public_resolved:
+                        if item[0] not in by_code or item[2] > by_code[item[0]][2]:
+                            by_code[item[0]] = item
+                    resolved = list(by_code.values())
+            page_type, drafts = parse_ocr_text(text, resolved)
+            batch.raw_text = text
+            batch.status = "needs_review"
+            current = latest_snapshot(session, complete_only=True)
+            current_buckets = {item.fund.code: item.bucket for item in current.items} if current else {}
+            for old in list(batch.items):
+                session.delete(old)
+            for draft in drafts:
+                if draft.kind != "holding":
+                    continue
+                fund = ensure_fund(session, draft.fund_code, draft.fund_name) if draft.fund_code else None
+                bucket = current_buckets.get(draft.fund_code, fund.default_bucket if fund else "satellite")
+                session.add(ImportItem(
+                    batch_id=batch.id, fund_code=draft.fund_code, fund_name=draft.fund_name,
+                    amount=draft.amount, displayed_profit=draft.displayed_profit,
+                    bucket=bucket,
+                    confidence=min(draft.confidence, sum(scores) / len(scores)) if scores else 0,
+                    raw_text=text, bbox_json=json.dumps(boxes, ensure_ascii=False),
+                    issues=(draft.issues or f"页面类型：{page_type}") + f"；已按产品类型自动归入{settings.rule_config.values['buckets'][bucket]['label']}，可人工覆盖",
+                ))
+            session.commit()
+            session.refresh(batch, attribute_names=["items"])
+        except Exception as exc:
+            batch.status, batch.error = "failed", "OCR 处理失败，可改用手工录入"
+            session.commit()
+            raise HTTPException(500, batch.error) from exc
+        return import_json(batch)
+
+    @app.get("/api/v2/imports")
+    def list_imports(session: DBSession) -> list[dict]:
+        rows = list(session.scalars(select(ImportBatch).options(selectinload(ImportBatch.items)).order_by(ImportBatch.id.desc()).limit(50)))
+        return [import_json(item) for item in rows]
+
+    @app.post("/api/v2/imports/{batch_id}/confirm", status_code=201)
+    def confirm_import(batch_id: int, payload: ImportConfirm, session: DBSession) -> dict:
+        batch = session.get(ImportBatch, batch_id)
+        if batch is None:
+            raise HTTPException(404, "导入批次不存在")
+        snapshot_payload = SnapshotCreate(
+            as_of_date=payload.as_of_date, completeness=payload.completeness, source="ocr",
+            note=f"来自导入批次 {batch.id}",
+            items=[{
+                "fund_code": item.fund_code,
+                "fund_name": item.fund_name,
+                "amount": item.amount,
+                "displayed_profit": item.displayed_profit,
+                "bucket": item.bucket,
+            } for item in payload.items],
+        )
+        snapshot = create_snapshot(session, snapshot_payload, settings.rule_config.values)
+        corrections = {item.fund_code: item for item in payload.items}
+        for draft in batch.items:
+            correction = corrections.get(draft.fund_code)
+            if correction is None:
+                continue
+            draft.confirmed = True
+            draft.correction_json = correction.model_dump_json()
+        batch.status = "confirmed" if payload.completeness == "complete" else "partially_confirmed"
+        session.commit()
+        return snapshot_json(snapshot)
+
+    def import_json(batch: ImportBatch) -> dict:
+        return {
+            "id": batch.id, "filename": batch.filename, "status": batch.status,
+            "raw_text": batch.raw_text, "error": batch.error, "created_at": batch.created_at.isoformat(),
+            "page_type": classify_page(batch.raw_text) if batch.raw_text else "unprocessed",
+            "items": [{
+                "id": item.id, "fund_code": item.fund_code, "fund_name": item.fund_name,
+                "amount": item.amount, "displayed_profit": item.displayed_profit,
+                "bucket": item.bucket, "confidence": item.confidence,
+                "issues": item.issues, "confirmed": item.confirmed,
+            } for item in batch.items],
+        }
 
     frontend_dist = settings.project_root / "frontend" / "dist"
     if frontend_dist.exists():
@@ -772,15 +754,11 @@ def create_app(
         if assets.exists():
             app.mount("/assets", StaticFiles(directory=assets), name="assets")
 
-        @app.get("/{full_path:path}", include_in_schema=False)
-        def frontend(full_path: str):
-            candidate_path = (frontend_dist / full_path).resolve()
-            if (
-                full_path
-                and candidate_path.is_relative_to(frontend_dist.resolve())
-                and candidate_path.is_file()
-            ):
-                return FileResponse(candidate_path)
+        @app.get("/{full_path:path}")
+        def spa(full_path: str):
+            target = frontend_dist / full_path
+            if full_path and target.is_file():
+                return FileResponse(target)
             return FileResponse(frontend_dist / "index.html")
 
     return app
