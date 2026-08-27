@@ -1,162 +1,74 @@
-# 个人基金研究助手
+# 基金仓位决策台
 
-面向中国公募基金和个人实验组合的本地研究工具。系统把公开基金数据、支付宝截图中的个人事实、确定性指标、风险规则和可选 DeepSeek 解释组合成可追溯报告。
+一个在 Windows 本机运行的个人基金复核工具。它把完整持仓快照、公开基金数据、官方公告和透明规则组合为“无需调整信号 / 需要复核”，不会自动交易，也不会把个人金额或截图发送给大模型。
 
-> 本项目用于个人学习、数据整理和投资研究辅助，不构成收益保证、自动投顾或交易指令。
+当前版本是 v2.1。旧 v1 数据库不迁移、不覆盖；v2 使用独立的 `data/private/fundlab_v2.sqlite3`。
 
-## MVP 已实现
+## 已实现
 
-- React + TypeScript + Vite 桌面端；
-- FastAPI + SQLAlchemy + SQLite 后端；
-- Alembic 初始迁移；
-- 六位基金代码候选列表；
-- AKShare 公开净值刷新，失败时明确回退到离线演示数据；
-- 指数基金、主动权益基金和普通债券基金的基础研究；
-- 2～3 个月与约 1 年两套期限；
-- 建仓候选、小幅加仓、继续持有、暂停加仓、减仓候选和退出复核；
-- 约 10% 阶段性回撤参考、目标仓位区间和条件触发器；
-- 主题基金识别与单主题仓位上限；
-- 支付宝候选、持仓和交易截图上传；
-- RapidOCR 本地识别、草稿校对、图片去重和正式确认；
-- 人工持仓快照与交易流水；
-- Evidence Pack 人工录入；
-- DeepSeek 可选结构化解释和 Mock 降级；
-- 全部页面按钮均连接真实 API 或本地动作；
-- pytest、Vitest、Playwright 和 GitHub Actions；
-- Windows 一键安装与启动脚本。
+- 三仓职责模型：流动防守仓 30%～50%、核心配置仓 30%～45%、卫星进攻仓 15%～30%；
+- 完整持仓快照门控，计划投入金额由用户填写，可手工录入或用 RapidOCR 生成待校对草稿；
+- AKShare 真实公开数据、累计净值优先、同类分位历史、公告索引、缓存和明确数据阻断；
+- 数据阻断 → 硬风险 → 质量恶化 → 替代对照的确定性优先级；
+- 三仓比例与目标区间独立展示，不占据首屏三件事、复核队列或 AI 解释；
+- 10/20 个交易日质量连续性与用户决定冷却；
+- 月度同类候选缓存、最多 50 只同类深算、最多 3 只替代对照和两次评估升级；
+- 复核项“同意 / 拒绝 / 稍后”，按交易日冷却并保存备注；
+- 可选 DeepSeek 结构化解释；关闭、缺 Key 或失败时不影响确定性结果；
+- 五页 React 界面、完整导出、数据库备份和 Windows 启动脚本。
 
-旧 Streamlit v0.1 仍保留，便于回归比较；新功能不再继续堆到旧页面。
+聚合数据或演示数据不能触发未核验的硬风险。`fixture/demo` Provider 只用于测试或显式演示，生产默认不会自动回退。
 
-## 数据如何分工
+## Windows 安装与启动
 
-| 数据 | 来源 | 用途 |
-| --- | --- | --- |
-| 个人候选、持仓、交易 | 支付宝截图或人工录入 | 描述你真正关注和持有的内容 |
-| 基金档案与净值 | AKShare 和后续官方 Provider | 计算确定性指标 |
-| 公告、政策和新闻 | 用户录入可追溯 Evidence Pack | 补充事件影响和反方证据 |
-| AI 解释 | DeepSeek 读取结构化报告与 Evidence Pack | 解释，不改变数字和操作状态 |
-
-支付宝详情页截图不能代替基金公开研究。DeepSeek 不直接接收原始图片。
-
-## Windows 快速开始
-
-需要：
-
-- Windows 10/11；
-- Python 3.12；
-- Node.js 22 LTS；
-- Git。
-
-首次安装：
+需要 Python 3.12、Node.js 22 LTS 和 Git。建议把仓库放在 `D:` 或其他非系统盘；虚拟环境也会创建在仓库内。
 
 ```powershell
 git clone https://github.com/JadeeJacson/fund-research-assistant.git
 cd fund-research-assistant
-.\scripts\mvp-install.ps1
+.\scripts\install.ps1
+.\scripts\start.ps1
 ```
 
-安装脚本会：
+浏览器访问 `http://127.0.0.1:8000`，接口文档在 `http://127.0.0.1:8000/api/docs`。
 
-1. 创建 `.venv-mvp`；
-2. 安装 FastAPI、AKShare、RapidOCR 等依赖；
-3. 安装前端依赖并生成生产构建；
-4. 在不存在时复制 `.env.example` 为 `.env`。
+首次使用：确认预算 → 上传截图或手工录入 → 校对并确认“当前全部持仓” → 回到决策台运行评估。
 
-启动：
+## DeepSeek（可选）
 
-```powershell
-.\scripts\mvp-start.ps1
-```
-
-浏览器会打开：
-
-```text
-http://127.0.0.1:8000
-```
-
-开发模式：
-
-```powershell
-.\scripts\mvp-dev.ps1
-```
-
-前端地址为 `http://127.0.0.1:5173`，API 为 `http://127.0.0.1:8000/api/v1`，接口文档为 `http://127.0.0.1:8000/api/docs`。
-
-## 首次使用顺序
-
-1. 在“候选研究”添加六位基金代码；
-2. 点击“刷新公开数据”；
-3. 分别运行“研究 2～3 个月”和“研究约 1 年”；
-4. 如有支付宝截图，在“截图导入”上传并逐字段校对；
-5. 确认导入后查看持仓和交易；
-6. 为候选报告录入公告或可靠新闻证据；
-7. 可选启用 DeepSeek，再生成结构化解释；
-8. 在“条件触发”保存阈值并主动检查。
-
-若页面标记“离线演示数据”，只能用于验证流程，不能作为实际操作依据。
-
-## DeepSeek
-
-编辑本机 `.env`：
+启动后进入“历史与数据”→“配置 AI”，即可在本机页面中填写 Key、开关、模型和 Base URL；保存后立即生效，不需要重启。也可以继续手工复制 `.env.example` 为 `.env` 并填写：
 
 ```dotenv
 FUNDLAB_AI_ENABLED=true
 DEEPSEEK_API_KEY=你的密钥
 DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=按当前官方文档填写
+DEEPSEEK_MODEL=你选择的当前模型
 ```
 
-模型名不在代码中写死。设置页的“测试 AI 连接”只发送最小匿名请求，不包含截图、持仓或交易。没有密钥时确定性分析仍可运行。
+已保存的 Key 不会回显，也不进入数据库、前端持久化、日志或导出。模型只接收公开基金身份、匿名定量摘要和已选择的 Evidence Pack。
 
-## 测试
-
-后端：
+## 验证与备份
 
 ```powershell
 cd backend
-..\.venv-mvp\Scripts\python.exe -m pytest
-```
-
-前端：
-
-```powershell
-cd frontend
+..\.venv\Scripts\python.exe -m pytest
+cd ..\frontend
 npm test
 npm run build
 npm run e2e
+cd ..
+.\scripts\backup.ps1
 ```
 
-## MVP 已知边界
+开发模式使用 `.\scripts\dev.ps1`。
 
-- AKShare 是便利入口，不是官方法定披露来源；
-- 当前事件证据需要人工提供 URL 和正文，尚未自动抓取官方公告；
-- OCR 可以识别截图中的可见内容，但不能恢复 UI 已截断文本；
-- 交易列表截图通常缺少确认净值、份额和费用，精确收益计算前必须补录；
-- 行业/主题仓位由可审计规则约束，不由 AI 自由分配；
-- 10% 是阶段性风险参考，不是止损保证；
-- 本地触发器需要用户主动检查；
-- 当前是单用户本地应用，不能直接暴露到公网。
+## 边界
 
-后续事项保留在 [实施路线](docs/ROADMAP.md)，MVP 的实际实现对应关系见 [MVP 实现说明](docs/MVP_IMPLEMENTATION.md)。
+- 本项目是个人研究与风险复核工具，不构成收益保证或确定性投资建议；
+- 不登录支付宝，不保存 Cookie、密码、交易流水或个人买入成本；
+- 支付宝个人盈亏只允许作为展示事实，不参与基金质量判断；
+- REITs、分级/杠杆、私募和个券只显示事实，不输出强操作结论；
+- 外部字段缺失时降低结论强度或阻断，不用名称或模型猜测补齐；
+- 不实现后台定时任务、云部署、认证或自动交易。
 
-## 文档
-
-- [文档索引](docs/INDEX.md)
-- [产品需求](docs/PRODUCT_REQUIREMENTS.md)
-- [项目状态](docs/PROJECT_STATUS.md)
-- [目标架构](docs/ARCHITECTURE.md)
-- [数据来源](docs/DATA_SOURCES.md)
-- [截图导入](docs/DATA_IMPORT.md)
-- [决策引擎](docs/DECISION_ENGINE.md)
-- [前端交互](docs/FRONTEND_CONTRACT.md)
-- [测试与验收](docs/TESTING_ACCEPTANCE.md)
-- [安全与隐私](docs/SECURITY.md)
-
-## 重要边界
-
-- 不登录支付宝；
-- 不保存支付宝 Cookie、密码或账户凭据；
-- 不自动申购、赎回、转换或调仓；
-- 不让大模型生成核心金融数字；
-- 不把单位净值低简单解释为“便宜”；
-- 不在资料不足时伪造强结论。
+详细规范见 [文档索引](docs/INDEX.md)。

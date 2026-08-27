@@ -1,0 +1,66 @@
+version: v2.1.2
+portfolio:
+  default_budget: 0.0
+  portfolio_drawdown_reference: 0.10
+  reject_cooldown_days: 5
+  defer_cooldown_days: 2
+buckets:
+  defense:
+    label: 流动防守仓
+    low: 0.30
+    mid: 0.40
+    high: 0.50
+    drawdown_reference: 0.02
+    horizon_days: 60
+    laggard_persistence_days: 20
+  core:
+    label: 核心配置仓
+    low: 0.30
+    mid: 0.35
+    high: 0.45
+    drawdown_reference: 0.08
+    horizon_days: 250
+    laggard_persistence_days: 20
+  satellite:
+    label: 卫星进攻仓
+    low: 0.15
+    mid: 0.25
+    high: 0.30
+    drawdown_reference: 0.18
+    horizon_days: 55
+    laggard_persistence_days: 10
+quality:
+  peer_percentile_max: 33.0
+  min_observations: 50
+  stale_domestic_trading_days: 3
+  stale_qdii_trading_days: 5
+alternative:
+  max_results: 3
+  strong_min_aum_yi: 2.0
+  watch_min_aum_yi: 0.5
+  strong_min_age_years: 2.0
+  watch_min_age_years: 1.0
+  min_improvements: 2
+  peer_percentile_improvement: 10.0
+  risk_adjusted_improvement: 0.15
+  expense_improvement: 0.0015
+  tracking_error_improvement: 0.15
+  drawdown_improvement:
+    defense: 0.005
+    core: 0.02
+    satellite: 0.03
+evidence:
+  max_headline_items: 3
+  source_priority:
+    S: 4
+    A: 3
+    B: 2
+    C: 1
+hard_risk_event_types:
+  - liquidation
+  - merger
+  - redemption_suspension
+  - contract_termination
+  - manager_departure
+  - index_rule_change
+  - regulatory_change

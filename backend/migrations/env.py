@@ -1,24 +1,19 @@
 from __future__ import annotations
 
-import os
 from logging.config import fileConfig
-from pathlib import Path
 
 from alembic import context
-from dotenv import load_dotenv
 from sqlalchemy import engine_from_config, pool
 
 from app import models  # noqa: F401
+from app.config import Settings
 from app.database import Base
 
 config = context.config
-load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-database_url = os.getenv("FUNDLAB_V1_DATABASE_URL")
-if database_url:
-    config.set_main_option("sqlalchemy.url", database_url)
+config.set_main_option("sqlalchemy.url", Settings.from_env().database_url)
 
 target_metadata = Base.metadata
 

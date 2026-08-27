@@ -1,9 +1,4 @@
-$ErrorActionPreference = "Stop"
-
-if (-not (Test-Path .\.venv\Scripts\Activate.ps1)) {
-    throw "未找到 .venv，请先运行 scripts/setup_windows.ps1"
-}
-
-& .\.venv\Scripts\Activate.ps1
-streamlit run app.py
+﻿$ErrorActionPreference = "Stop"
+Write-Warning "start_windows.ps1 是兼容入口；建议使用 scripts/start.ps1。"
+& (Join-Path $PSScriptRoot "start.ps1")
 

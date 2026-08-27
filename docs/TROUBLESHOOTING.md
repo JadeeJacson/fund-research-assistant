@@ -1,43 +1,9 @@
 # 故障排查
 
-## AKShare 获取失败
-
-1. 升级 AKShare：`pip install --upgrade akshare`；
-2. 运行 `fundlab analyze <代码>` 查看错误；
-3. 查看“数据质量”页面；
-4. 如果本地已有缓存，使用 `--no-refresh`；
-5. 上游字段变化时只修改 `akshare_provider.py`；
-6. 临时使用 `ManualCsvProvider`。
-
-## DeepSeek 返回空内容或 JSON 不完整
-
-- 增大 `DEEPSEEK_MAX_TOKENS`；
-- 保持 Prompt 中明确要求 JSON；
-- 检查模型名是否仍可用；
-- 查看“数据质量”页面中的 AI 调用错误；
-- 删除 `data/cache/ai/` 中对应缓存后重试；
-- 不要无限增加重试次数，以免产生意外费用。
-
-## AI 页面总是 Mock
-
-检查：
-
-```dotenv
-FUNDLAB_AI_ENABLED=true
-DEEPSEEK_API_KEY=非空
-```
-
-修改 `.env` 后重启 Streamlit。
-
-## 数据库锁定
-
-本项目为单用户本地应用。关闭重复运行的 Streamlit 或脚本后重试。若需要多进程写入或云端多用户，应迁移到 PostgreSQL，而不是继续扩大 SQLite 的使用范围。
-
-## Streamlit 找不到 fundlab
-
-确认已在虚拟环境中执行：
-
-```powershell
-pip install -e ".[dev]"
-```
-
+- “尚未安装”：运行 `.\scripts\install.ps1`，确认 Python 3.12 和 Node.js 在 PATH；
+- 公开数据刷新失败：检查网络后重试；页面不会回退演示数据，缓存过期会标 limited/blocked；
+- 无法开始评估：确认最近快照勾选了“当前全部持仓”，partial 截图草稿不参与；
+- OCR 失败：改用手工录入，原图不应发送给外部服务；
+- AI 显示未启用：这是正常降级；需要时在本机 `.env` 填写完整配置；
+- 端口占用：结束占用 8000/5173 的本地进程后重试；
+- 数据库问题：先停止应用，运行 `.\scripts\backup.ps1` 保存副本，再检查 `data/private/fundlab_v2.sqlite3`。

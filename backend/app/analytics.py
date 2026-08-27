@@ -16,6 +16,8 @@ class Metrics:
     annualized_return: float | None
     volatility: float | None
     max_drawdown: float | None
+    sharpe: float | None
+    calmar: float | None
 
     def as_dict(self) -> dict:
         values = asdict(self)
@@ -53,6 +55,8 @@ def calculate_metrics(points: list[tuple[date, float]]) -> Metrics:
     for value in values:
         peak = max(peak, value)
         max_drawdown = min(max_drawdown, value / peak - 1)
+    sharpe = annualized / volatility if annualized is not None and volatility and volatility > 0 else None
+    calmar = annualized / abs(max_drawdown) if annualized is not None and max_drawdown < 0 else None
     return Metrics(
         as_of_date=clean[-1][0],
         observations=len(clean),
@@ -63,4 +67,34 @@ def calculate_metrics(points: list[tuple[date, float]]) -> Metrics:
         annualized_return=annualized,
         volatility=volatility,
         max_drawdown=max_drawdown,
+        sharpe=sharpe,
+        calmar=calmar,
     )
+
+
+def calculate_window_metrics(points: list[tuple[date, float]], trading_days: int) -> Metrics:
+    if not points:
+        raise ValueError("缺少净值数据")
+    return calculate_metrics(sorted(points)[-(trading_days + 1) :])
+
+
+def calculate_performance_chart(
+    points: list[tuple[date, float]],
+    trading_days: int = 252,
+) -> list[dict[str, str | float]]:
+    """Normalize total-return NAV into intuitive cumulative-return and drawdown series."""
+    clean = sorted((day, float(value)) for day, value in points if value and value > 0)
+    window = clean[-(trading_days + 1) :]
+    if len(window) < 2:
+        return []
+    base = window[0][1]
+    peak = base
+    output: list[dict[str, str | float]] = []
+    for day, value in window:
+        peak = max(peak, value)
+        output.append({
+            "date": day.isoformat(),
+            "cumulative_return": value / base - 1,
+            "drawdown": value / peak - 1,
+        })
+    return output
